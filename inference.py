@@ -146,6 +146,61 @@ def segment_by_time(features, alignments, num_frames):
     return segments
 
 
+def segment_by_aperture(features, n_digits, fps, smooth_window=3):
+    """
+    Automatically segment a video into n_digits intervals by detecting
+    local minima in vertical aperture (feature 0) — the mouth closes
+    between digits. Picks the n_digits-1 deepest minima as boundaries.
+    """
+    from scipy.signal import savgol_filter, argrelmin
+
+    aperture = features[:, 0]
+    T = len(aperture)
+
+    # Smooth to suppress within-digit noise (window must be odd)
+    win = smooth_window if smooth_window % 2 == 1 else smooth_window + 1
+    win = min(win, T if T % 2 == 1 else T - 1)
+    smoothed = savgol_filter(aperture, window_length=win, polyorder=1) if T > win else aperture
+
+    # Find all local minima at order=1 (most sensitive), then pick deepest n_digits-1
+    minima_idx = argrelmin(smoothed, order=1)[0]
+
+    if len(minima_idx) >= n_digits - 1:
+        depths = smoothed[minima_idx]
+        chosen = minima_idx[np.argsort(depths)[:n_digits - 1]]
+    else:
+        # Fewer minima than needed: supplement with the lowest points in
+        # equally-spaced windows to guarantee n_digits-1 boundaries
+        step = T / n_digits
+        window_mins = []
+        for i in range(n_digits - 1):
+            center = int(round((i + 1) * step))
+            lo = max(0, center - int(step // 2))
+            hi = min(T, center + int(step // 2))
+            window_mins.append(lo + np.argmin(smoothed[lo:hi]))
+        chosen = np.array(window_mins)
+
+    boundaries = sorted(set(int(b) for b in chosen))
+
+    # Build segments
+    starts = [0] + boundaries
+    ends = boundaries + [T]
+    segments = [features[s:e] for s, e in zip(starts, ends)]
+
+    frames_info = ' | '.join(f'{e-s}fr' for s, e in zip(starts, ends))
+    print(f"  Auto-segmented: [{frames_info}]")
+    return segments
+
+    # Build segments from boundaries
+    starts = [0] + boundaries
+    ends = boundaries + [T]
+    segments = [features[s:e] for s, e in zip(starts, ends)]
+
+    frames_info = ' | '.join(f'{e-s}fr' for s, e in zip(starts, ends))
+    print(f"  Auto-segmented: [{frames_info}]")
+    return segments
+
+
 def pad_segment(seg, max_len):
     """Pad/truncate a segment to max_len, return (feat, mask)."""
     T = seg.shape[0]
@@ -213,8 +268,6 @@ if __name__ == '__main__':
                         help='Verification mode (default: sequence)')
     parser.add_argument('--model_path', type=str, default=None,
                         help='Path to model checkpoint')
-    parser.add_argument('--threshold', type=float, default=0.5,
-                        help='Decision threshold (default: 0.5)')
     parser.add_argument('--face_model', type=str, default=FACE_MODEL_PATH,
                         help=f'Path to face landmarker model (default: {FACE_MODEL_PATH})')
     args = parser.parse_args()
@@ -258,15 +311,11 @@ if __name__ == '__main__':
         print(f"  Digits from .lab: {' '.join(digits)}")
     else:
         digits = args.digits.strip().split()
-        # Without .lab, split video evenly across digits
         n_digits = len(digits)
-        frames_per_digit = num_frames // n_digits
-        segments = []
-        for i in range(n_digits):
-            sf = i * frames_per_digit
-            ef = (i + 1) * frames_per_digit if i < n_digits - 1 else num_frames
-            segments.append(features[sf:ef])
-        print(f"  Digits (even split): {' '.join(digits)} ({frames_per_digit} frames each)")
+        # Auto-segment using lip aperture minima (mouth closes between digits)
+        print(f"  No .lab provided — auto-segmenting by lip aperture minima...")
+        segments = segment_by_aperture(features, n_digits, fps)
+        print(f"  Digits: {' '.join(digits)}")
 
     # Validate digits
     for d in digits:
@@ -289,26 +338,18 @@ if __name__ == '__main__':
     # 5. Run inference
     print(f"\n{'='*50}")
     print(f"  Claimed digits: {' '.join(digits)}")
-    print(f"  Mode: {args.mode}, Threshold: {args.threshold}")
+    print(f"  Mode: {args.mode}")
     print(f"{'='*50}")
 
     if args.mode == 'sequence':
         prob = infer_sequence(model, segments, digits, DEVICE)
-        verdict = "MATCH" if prob >= args.threshold else "MISMATCH"
         print(f"\n  Sequence probability: {prob:.4f}")
-        print(f"  Verdict: {verdict}")
     else:
         digit_results = infer_per_digit(model, segments, digits, DEVICE)
-        print(f"\n  Per-digit results:")
-        all_match = True
+        print(f"\n  Per-digit probabilities:")
         for digit, prob in digit_results:
-            verdict = "MATCH" if prob >= args.threshold else "MISMATCH"
-            if prob < args.threshold:
-                all_match = False
-            print(f"    Digit '{digit}': {prob:.4f} -> {verdict}")
-        overall = "MATCH" if all_match else "MISMATCH"
+            print(f"    Digit '{digit}': {prob:.4f}")
         avg_prob = np.mean([p for _, p in digit_results])
         print(f"\n  Average probability: {avg_prob:.4f}")
-        print(f"  Overall verdict: {overall}")
 
     print()
