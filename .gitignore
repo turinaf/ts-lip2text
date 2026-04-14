@@ -7,3 +7,5 @@ processed_data/
 runs/
 models/
 __pycache__/
+plots/
+.vscode/
