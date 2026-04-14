@@ -21,7 +21,8 @@ import os
 import json
 import time
 
-from model import DigitVerifier, SequenceVerifier, CHAR_TO_IDX, N_CLASSES
+from model import (DigitVerifier, SequenceVerifier, CTCLipReader,
+                   CHAR_TO_IDX, N_CLASSES, CTC_BLANK, VOCAB)
 
 # --- Configuration ---
 PROCESSED_DIR = 'processed_data'
@@ -31,6 +32,7 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 # Hyperparameters
 MAX_SEQ_LEN = 30        # max frames per digit segment (pad/truncate)
+MAX_VIDEO_LEN = 150     # max frames for full video (CTC mode)
 N_FEATURES = 5          # lip features per frame
 EMBED_DIM = 64          # embedding dimension
 HIDDEN_DIM = 128        # GRU hidden dimension
@@ -236,12 +238,153 @@ def evaluate(model, loader, device):
     }
 
 
+# --- CTC Dataset ---
+class CTCDataset(Dataset):
+    """
+    Full-video dataset for CTC training.
+    Each sample is (full_features, feature_length, digit_targets, target_length).
+    No segmentation needed.
+    """
+    def __init__(self, npz_path, max_video_len=MAX_VIDEO_LEN):
+        data = np.load(npz_path, allow_pickle=True)
+        self.full_features = data['full_features']
+        self.digit_sequences = data['digit_sequences']
+        self.max_video_len = max_video_len
+
+    def __len__(self):
+        return len(self.full_features)
+
+    def __getitem__(self, idx):
+        feat = self.full_features[idx]  # (T, 5)
+        digits = self.digit_sequences[idx]
+        T = feat.shape[0]
+
+        # Pad/truncate to max_video_len
+        if T >= self.max_video_len:
+            padded = feat[:self.max_video_len].astype(np.float32)
+            length = self.max_video_len
+        else:
+            padded = np.zeros((self.max_video_len, N_FEATURES), dtype=np.float32)
+            padded[:T] = feat
+            length = T
+
+        # Target: digit indices
+        targets = [char_to_idx(str(d)) for d in digits]
+
+        return (
+            torch.FloatTensor(padded),
+            torch.LongTensor([length]),
+            torch.LongTensor(targets),
+            torch.LongTensor([len(targets)]),
+        )
+
+
+def ctc_collate(batch):
+    """Custom collate: stack features, concatenate variable-length targets."""
+    feats, lengths, targets, target_lengths = zip(*batch)
+    feats = torch.stack(feats)
+    lengths = torch.cat(lengths)
+    targets = torch.cat(targets)
+    target_lengths = torch.cat(target_lengths)
+    return feats, lengths, targets, target_lengths
+
+
+# --- CTC Training ---
+def train_epoch_ctc(model, loader, optimizer, ctc_loss, device):
+    model.train()
+    total_loss = 0
+    n_batches = 0
+
+    pbar = tqdm(loader, desc='Train CTC', leave=False)
+    for feats, lengths, targets, target_lengths in pbar:
+        feats = feats.to(device)
+        lengths = lengths.to(device)
+        targets = targets.to(device)
+        target_lengths = target_lengths.to(device)
+
+        logits = model(feats, lengths)  # (B, T, C)
+        log_probs = logits.log_softmax(dim=2)  # (B, T, C)
+        # CTC loss expects (T, B, C)
+        log_probs = log_probs.permute(1, 0, 2)
+
+        loss = ctc_loss(log_probs, targets, lengths, target_lengths)
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
+
+        total_loss += loss.item()
+        n_batches += 1
+        pbar.set_postfix(loss=f'{total_loss / n_batches:.4f}')
+
+    return total_loss / max(n_batches, 1)
+
+
+def evaluate_ctc(model, loader, device):
+    """Evaluate CTC model: sequence accuracy, character error rate."""
+    model.eval()
+    total_correct = 0
+    total_sequences = 0
+    total_chars = 0
+    total_edit_dist = 0
+
+    with torch.no_grad():
+        for feats, lengths, targets, target_lengths in tqdm(loader, desc='Eval CTC', leave=False):
+            feats = feats.to(device)
+            lengths = lengths.to(device)
+
+            logits = model(feats, lengths)
+            decoded_batch = model.decode_batch(logits, lengths)
+
+            # Reconstruct per-sample targets
+            offset = 0
+            for i in range(feats.size(0)):
+                tlen = target_lengths[i].item()
+                target_seq = targets[offset:offset+tlen].tolist()
+                offset += tlen
+                pred_seq = decoded_batch[i]
+
+                total_sequences += 1
+                if pred_seq == target_seq:
+                    total_correct += 1
+
+                # Character-level edit distance
+                total_chars += tlen
+                total_edit_dist += _edit_distance(pred_seq, target_seq)
+
+    seq_acc = total_correct / max(total_sequences, 1)
+    cer = total_edit_dist / max(total_chars, 1)
+    return {
+        'seq_accuracy': seq_acc,
+        'char_error_rate': cer,
+        'n_sequences': total_sequences,
+        'n_correct': total_correct,
+    }
+
+
+def _edit_distance(pred, target):
+    """Levenshtein distance."""
+    m, n = len(pred), len(target)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev = dp[0]
+        dp[0] = i
+        for j in range(1, n + 1):
+            temp = dp[j]
+            if pred[i-1] == target[j-1]:
+                dp[j] = prev
+            else:
+                dp[j] = 1 + min(prev, dp[j], dp[j-1])
+            prev = temp
+    return dp[n]
+
+
 # --- Main ---
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', choices=['digit', 'sequence'], default='sequence',
-                        help='digit: per-digit verification, sequence: full 8-digit verification')
+    parser.add_argument('--mode', choices=['digit', 'sequence', 'ctc'], default='sequence',
+                        help='digit: per-digit, sequence: full 8-digit, ctc: alignment-free')
     parser.add_argument('--epochs', type=int, default=N_EPOCHS)
     parser.add_argument('--batch_size', type=int, default=BATCH_SIZE)
     parser.add_argument('--lr', type=float, default=LEARNING_RATE)
@@ -264,21 +407,29 @@ if __name__ == '__main__':
         test_ds = LipVerificationDataset(test_path, seed=99)
         model = DigitVerifier(n_classes=N_CLASSES, embed_dim=EMBED_DIM,
                               n_features=N_FEATURES, hidden_dim=HIDDEN_DIM).to(DEVICE)
-    else:
+    elif args.mode == 'sequence':
         train_ds = SequenceVerificationDataset(train_path)
         test_ds = SequenceVerificationDataset(test_path, seed=99)
         model = SequenceVerifier(n_classes=N_CLASSES, embed_dim=EMBED_DIM,
                                  n_features=N_FEATURES, hidden_dim=HIDDEN_DIM).to(DEVICE)
+    else:  # ctc
+        train_ds = CTCDataset(train_path)
+        test_ds = CTCDataset(test_path)
+        model = CTCLipReader(n_features=N_FEATURES, hidden_dim=HIDDEN_DIM).to(DEVICE)
 
+    collate_fn = ctc_collate if args.mode == 'ctc' else None
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=0, pin_memory=True)
+                              num_workers=0, pin_memory=True, collate_fn=collate_fn)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                             num_workers=0, pin_memory=True)
+                             num_workers=0, pin_memory=True, collate_fn=collate_fn)
 
-    print(f"Train: {len(train_ds)} pairs, Test: {len(test_ds)} pairs")
+    print(f"Train: {len(train_ds)} samples, Test: {len(test_ds)} samples")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    criterion = nn.BCEWithLogitsLoss()
+    if args.mode == 'ctc':
+        criterion = nn.CTCLoss(blank=CTC_BLANK, zero_infinity=True)
+    else:
+        criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
@@ -287,13 +438,17 @@ if __name__ == '__main__':
     writer = SummaryWriter(log_dir=os.path.join(LOG_DIR, run_name))
     print(f"TensorBoard logs: {LOG_DIR}/{run_name}")
 
-    best_auc = 0
+    best_metric = 0  # best AUC (digit/sequence) or best seq_accuracy (ctc)
     results_log = []
+    model_save_path = os.path.join(MODEL_DIR, f'best_{args.mode}_verifier.pt')
 
     print(f"\nTraining for {args.epochs} epochs...")
 
     for epoch in range(1, args.epochs + 1):
-        loss = train_epoch(model, train_loader, optimizer, criterion, DEVICE)
+        if args.mode == 'ctc':
+            loss = train_epoch_ctc(model, train_loader, optimizer, criterion, DEVICE)
+        else:
+            loss = train_epoch(model, train_loader, optimizer, criterion, DEVICE)
         scheduler.step()
 
         writer.add_scalar('train/loss', loss, epoch)
@@ -301,53 +456,68 @@ if __name__ == '__main__':
 
         # Evaluate every 5 epochs or at the end
         if epoch % 5 == 0 or epoch == args.epochs:
-            metrics = evaluate(model, test_loader, DEVICE)
-            results_log.append({'epoch': epoch, 'loss': loss, **metrics})
+            if args.mode == 'ctc':
+                metrics = evaluate_ctc(model, test_loader, DEVICE)
+                results_log.append({'epoch': epoch, 'loss': loss, **metrics})
+                writer.add_scalar('eval/seq_accuracy', metrics['seq_accuracy'], epoch)
+                writer.add_scalar('eval/char_error_rate', metrics['char_error_rate'], epoch)
+                print(f"Epoch {epoch:3d} | loss={loss:.4f} | "
+                      f"SeqAcc={metrics['seq_accuracy']:.4f} | "
+                      f"CER={metrics['char_error_rate']:.4f}")
+                track_metric = metrics['seq_accuracy']
+            else:
+                metrics = evaluate(model, test_loader, DEVICE)
+                results_log.append({'epoch': epoch, 'loss': loss, **metrics})
+                writer.add_scalar('eval/auc', metrics['auc'], epoch)
+                writer.add_scalar('eval/eer', metrics['eer'], epoch)
+                writer.add_scalar('eval/acc_at_eer', metrics['acc_at_eer'], epoch)
+                writer.add_scalar('eval/acc_at_05', metrics['acc_at_05'], epoch)
+                print(f"Epoch {epoch:3d} | loss={loss:.4f} | AUC={metrics['auc']:.4f} | "
+                      f"EER={metrics['eer']:.4f} | Acc@EER={metrics['acc_at_eer']:.4f} | "
+                      f"Acc@0.5={metrics['acc_at_05']:.4f}")
+                track_metric = metrics['auc']
 
-            writer.add_scalar('eval/auc', metrics['auc'], epoch)
-            writer.add_scalar('eval/eer', metrics['eer'], epoch)
-            writer.add_scalar('eval/acc_at_eer', metrics['acc_at_eer'], epoch)
-            writer.add_scalar('eval/acc_at_05', metrics['acc_at_05'], epoch)
-
-            print(f"Epoch {epoch:3d} | loss={loss:.4f} | AUC={metrics['auc']:.4f} | "
-                  f"EER={metrics['eer']:.4f} | Acc@EER={metrics['acc_at_eer']:.4f} | "
-                  f"Acc@0.5={metrics['acc_at_05']:.4f}")
-
-            if metrics['auc'] > best_auc:
-                best_auc = metrics['auc']
-                torch.save(model.state_dict(),
-                           os.path.join(MODEL_DIR, f'best_{args.mode}_verifier.pt'))
+            if track_metric > best_metric:
+                best_metric = track_metric
+                torch.save(model.state_dict(), model_save_path)
         else:
             print(f"Epoch {epoch:3d} | loss={loss:.4f}")
 
     # Final evaluation
     print(f"\n{'='*55}")
     print("Final evaluation on test set:")
-    model.load_state_dict(torch.load(os.path.join(MODEL_DIR, f'best_{args.mode}_verifier.pt'),
-                                     weights_only=True))
-    final_metrics = evaluate(model, test_loader, DEVICE)
+    model.load_state_dict(torch.load(model_save_path, weights_only=True))
+    if args.mode == 'ctc':
+        final_metrics = evaluate_ctc(model, test_loader, DEVICE)
+    else:
+        final_metrics = evaluate(model, test_loader, DEVICE)
     for k, v in final_metrics.items():
         print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 
-    writer.add_hparams(
-        {'mode': args.mode, 'lr': args.lr, 'batch_size': args.batch_size,
-         'epochs': args.epochs, 'embed_dim': EMBED_DIM, 'hidden_dim': HIDDEN_DIM},
-        {'hparam/auc': final_metrics['auc'], 'hparam/eer': final_metrics['eer'],
-         'hparam/acc': final_metrics['acc_at_eer']},
-    )
+    if args.mode == 'ctc':
+        writer.add_hparams(
+            {'mode': args.mode, 'lr': args.lr, 'batch_size': args.batch_size,
+             'epochs': args.epochs, 'hidden_dim': HIDDEN_DIM},
+            {'hparam/seq_accuracy': final_metrics['seq_accuracy'],
+             'hparam/cer': final_metrics['char_error_rate']},
+        )
+    else:
+        writer.add_hparams(
+            {'mode': args.mode, 'lr': args.lr, 'batch_size': args.batch_size,
+             'epochs': args.epochs, 'embed_dim': EMBED_DIM, 'hidden_dim': HIDDEN_DIM},
+            {'hparam/auc': final_metrics['auc'], 'hparam/eer': final_metrics['eer'],
+             'hparam/acc': final_metrics['acc_at_eer']},
+        )
     writer.close()
 
     # Save results
     results = {
         'mode': args.mode,
         'hyperparams': {
-            'max_seq_len': MAX_SEQ_LEN,
-            'embed_dim': EMBED_DIM,
             'hidden_dim': HIDDEN_DIM,
             'batch_size': args.batch_size,
             'lr': args.lr,
             'epochs': args.epochs,
-            'neg_ratio': NEG_RATIO,
             'n_classes': N_CLASSES,
         },
         'final_metrics': {k: float(v) if isinstance(v, (float, np.floating)) else v

@@ -18,12 +18,14 @@ import torch
 import argparse
 import os
 
-from model import DigitVerifier, SequenceVerifier, CHAR_TO_IDX, VOCAB, N_CLASSES
+from model import (DigitVerifier, SequenceVerifier, CTCLipReader,
+                   CHAR_TO_IDX, VOCAB, N_CLASSES)
 
 # --- Configuration ---
 FACE_MODEL_PATH = 'data/face_landmarker.task'
 MODEL_DIR = 'models'
 MAX_SEQ_LEN = 30
+MAX_VIDEO_LEN = 150
 N_FEATURES = 5
 EMBED_DIM = 64
 HIDDEN_DIM = 128
@@ -254,6 +256,44 @@ def infer_per_digit(model, segments, digits, device):
     return results
 
 
+def infer_ctc(model, features, device, max_video_len=MAX_VIDEO_LEN):
+    """Run CTC inference: predict digit sequence from full video features."""
+    T = features.shape[0]
+    length = min(T, max_video_len)
+
+    if T >= max_video_len:
+        padded = features[:max_video_len].astype(np.float32)
+    else:
+        padded = np.zeros((max_video_len, N_FEATURES), dtype=np.float32)
+        padded[:T] = features
+
+    feat_t = torch.FloatTensor(padded).unsqueeze(0).to(device)  # (1, T, 5)
+    length_t = torch.LongTensor([length]).to(device)
+
+    with torch.no_grad():
+        logits = model(feat_t, length_t)  # (1, T, C)
+        decoded = model.decode_greedy(logits[0, :length])
+
+    predicted_digits = [VOCAB[i] for i in decoded]
+    return predicted_digits
+
+
+def _edit_distance(pred, target):
+    m, n = len(pred), len(target)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev = dp[0]
+        dp[0] = i
+        for j in range(1, n + 1):
+            temp = dp[j]
+            if pred[i-1] == target[j-1]:
+                dp[j] = prev
+            else:
+                dp[j] = 1 + min(prev, dp[j], dp[j-1])
+            prev = temp
+    return dp[n]
+
+
 # --- Main ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Lip-text verification inference')
@@ -264,13 +304,19 @@ if __name__ == '__main__':
                        help='Claimed digit string, space-separated (e.g. "1 3 5 7 9 2 4 6")')
     group.add_argument('--lab', type=str,
                        help='Path to .lab annotation file (contains digits + time ranges)')
-    parser.add_argument('--mode', choices=['digit', 'sequence'], default='sequence',
-                        help='Verification mode (default: sequence)')
+    group.add_argument('--recognize', action='store_true',
+                       help='CTC recognition only: predict digits from video (no claimed digits needed)')
+    parser.add_argument('--mode', choices=['digit', 'sequence', 'ctc'], default='sequence',
+                        help='Verification mode (default: sequence). ctc: alignment-free')
     parser.add_argument('--model_path', type=str, default=None,
                         help='Path to model checkpoint')
     parser.add_argument('--face_model', type=str, default=FACE_MODEL_PATH,
                         help=f'Path to face landmarker model (default: {FACE_MODEL_PATH})')
     args = parser.parse_args()
+
+    # --recognize implies ctc mode
+    if args.recognize:
+        args.mode = 'ctc'
 
     model_path = args.model_path or os.path.join(MODEL_DIR, f'best_{args.mode}_verifier.pt')
 
@@ -305,7 +351,17 @@ if __name__ == '__main__':
     print(f"  Features shape: {features.shape}")
 
     # 3. Parse digits and segment
-    if args.lab:
+    if args.mode == 'ctc':
+        # CTC mode: no segmentation needed
+        if args.lab:
+            digits, _ = parse_lab_file(args.lab, fps)
+            print(f"  Ground truth digits: {' '.join(digits)}")
+        elif args.digits:
+            digits = args.digits.strip().split()
+            print(f"  Claimed digits: {' '.join(digits)}")
+        else:
+            digits = None  # pure recognition, no comparison
+    elif args.lab:
         digits, alignments = parse_lab_file(args.lab, fps)
         segments = segment_by_time(features, alignments, num_frames)
         print(f"  Digits from .lab: {' '.join(digits)}")
@@ -317,19 +373,22 @@ if __name__ == '__main__':
         segments = segment_by_aperture(features, n_digits, fps)
         print(f"  Digits: {' '.join(digits)}")
 
-    # Validate digits
-    for d in digits:
-        if d not in CHAR_TO_IDX:
-            print(f"ERROR: Unknown digit '{d}'. Valid: {VOCAB}")
-            exit(1)
+    # Validate digits (skip for pure recognition)
+    if digits is not None:
+        for d in digits:
+            if d not in CHAR_TO_IDX:
+                print(f"ERROR: Unknown digit '{d}'. Valid: {VOCAB}")
+                exit(1)
 
     # 4. Load model
     if args.mode == 'digit':
         model = DigitVerifier(n_classes=N_CLASSES, embed_dim=EMBED_DIM,
                               n_features=N_FEATURES, hidden_dim=HIDDEN_DIM).to(DEVICE)
-    else:
+    elif args.mode == 'sequence':
         model = SequenceVerifier(n_classes=N_CLASSES, embed_dim=EMBED_DIM,
                                  n_features=N_FEATURES, hidden_dim=HIDDEN_DIM).to(DEVICE)
+    else:  # ctc
+        model = CTCLipReader(n_features=N_FEATURES, hidden_dim=HIDDEN_DIM).to(DEVICE)
 
     model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
     model.eval()
@@ -337,13 +396,22 @@ if __name__ == '__main__':
 
     # 5. Run inference
     print(f"\n{'='*50}")
-    print(f"  Claimed digits: {' '.join(digits)}")
     print(f"  Mode: {args.mode}")
     print(f"{'='*50}")
 
-    if args.mode == 'sequence':
+    if args.mode == 'ctc':
+        predicted = infer_ctc(model, features, DEVICE)
+        print(f"\n  Predicted digits: {' '.join(predicted)}")
+        if digits is not None:
+            match = predicted == digits
+            edit_dist = _edit_distance(predicted, digits)
+            print(f"  Claimed digits:   {' '.join(digits)}")
+            print(f"  Exact match: {match}")
+            print(f"  Edit distance: {edit_dist}")
+    elif args.mode == 'sequence':
         prob = infer_sequence(model, segments, digits, DEVICE)
-        print(f"\n  Sequence probability: {prob:.4f}")
+        print(f"\n  Claimed digits: {' '.join(digits)}")
+        print(f"  Sequence probability: {prob:.4f}")
     else:
         digit_results = infer_per_digit(model, segments, digits, DEVICE)
         print(f"\n  Per-digit probabilities:")
