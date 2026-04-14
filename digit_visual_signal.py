@@ -111,15 +111,12 @@ top_inner = all_face_landmarks[:, IDX_TOP_INNER]
 bot_inner = all_face_landmarks[:, IDX_BOTTOM_INNER]
 
 # Geometric features (normalized by inter-ocular distance)
-vert_aperture = np.linalg.norm(top_outer - bot_outer, axis=1) / interocular
+vert_aperture = np.linalg.norm(top_inner - bot_inner, axis=1) / interocular
 horiz_spread = np.linalg.norm(left_corner - right_corner, axis=1) / interocular
-inner_vert = np.linalg.norm(top_inner - bot_inner, axis=1) / interocular
 
-# Area, perimeter, compactness, corner angle (per-frame)
-outer_areas = np.zeros(num_frames)
+# Area, perimeter, compactness (per-frame)
 inner_areas = np.zeros(num_frames)
 outer_compactness = np.zeros(num_frames)
-corner_angles = np.zeros(num_frames)
 
 for i in range(num_frames):
     lm = all_face_landmarks[i]
@@ -130,31 +127,26 @@ for i in range(num_frames):
     op = polygon_perimeter(outer_pts)
 
     norm2 = interocular[i] ** 2
-    outer_areas[i] = oa / norm2
     inner_areas[i] = ia / norm2
     outer_compactness[i] = (4 * np.pi * oa) / (op ** 2 + 1e-8)
-    corner_angles[i] = compute_angle(lm[IDX_LEFT_CORNER], lm[IDX_TOP_OUTER], lm[IDX_RIGHT_CORNER])
 
-# Dynamic features: velocities (1st derivative)
+# Dynamic feature: lip speed (magnitude of velocity vector)
 vert_velocity = np.gradient(vert_aperture)
 horiz_velocity = np.gradient(horiz_spread)
+lip_speed = np.sqrt(vert_velocity ** 2 + horiz_velocity ** 2)
 
 feature_names = [
-    'Vertical Aperture',    # 0 - how open the mouth is vertically
+    'Vertical Aperture',    # 0 - inner lip opening (most speech-relevant)
     'Horizontal Spread',    # 1 - how wide the lips stretch
-    'Inner Vertical Ap.',   # 2 - actual oral aperture (most speech-relevant)
-    'Outer Lip Area',       # 3 - total mouth shape area
-    'Inner Lip Area',       # 4 - oral opening area
-    'Compactness',          # 5 - circular (rounded) vs elongated opening
-    'Corner Angle',         # 6 - lip corners spread vs pursed
-    'Vert. Velocity',       # 7 - speed of opening/closing
-    'Horiz. Velocity',      # 8 - speed of spreading/narrowing
+    'Inner Lip Area',       # 2 - oral opening area
+    'Compactness',          # 3 - circular (rounded) vs elongated opening
+    'Lip Speed',            # 4 - overall speed of lip movement
 ]
 
 features = np.column_stack([
-    vert_aperture, horiz_spread, inner_vert,
-    outer_areas, inner_areas, outer_compactness, corner_angles,
-    vert_velocity, horiz_velocity,
+    vert_aperture, horiz_spread,
+    inner_areas, outer_compactness,
+    lip_speed,
 ])
 print(f"Feature matrix: {features.shape} ({num_frames} frames × {len(feature_names)} features)")
 
@@ -229,7 +221,7 @@ plot_features_timeline(features, feature_names, alignments, fps, num_frames)
 # --- 7. Plot 2: Per-digit comparison (overlay all occurrences of same digit) ---
 def plot_digit_comparison(features, feature_names, alignments):
     unique_digits = sorted(set(d for _, _, d in alignments))
-    key_feats = [0, 2, 4, 5, 6]  # vert_aperture, inner_vert, inner_area, compactness, corner_angle
+    key_feats = [0, 1, 2, 3, 4]  # all features
 
     fig, axes = plt.subplots(len(unique_digits), len(key_feats),
                              figsize=(3.5 * len(key_feats), 2.5 * len(unique_digits)),
@@ -263,7 +255,7 @@ plot_digit_comparison(features, feature_names, alignments)
 # --- 8. Plot 3: Cross-digit comparison ---
 def plot_cross_digit(features, feature_names, alignments):
     unique_digits = sorted(set(d for _, _, d in alignments))
-    key_feats = [0, 2, 4, 5]
+    key_feats = [0, 1, 2, 3]
     cmap = plt.get_cmap('tab10')
     colors = {d: cmap(i % 10) for i, d in enumerate(unique_digits)}
 

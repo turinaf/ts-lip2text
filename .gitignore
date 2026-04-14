@@ -2,3 +2,8 @@ data/
 *.zip
 *.mp4
 .DS_Store/
+output/
+processed_data/
+runs/
+models/
+__pycache__/
