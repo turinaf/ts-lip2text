@@ -88,16 +88,17 @@ class SequenceVerifier(nn.Module):
             nn.Linear(64, 1),
         )
         self.seq_agg = nn.Sequential(
-            nn.Linear(seq_len, 32),
+            nn.Linear(1, 32),
             nn.ReLU(),
             nn.Linear(32, 1),
         )
 
-    def forward(self, segments, masks, claimed_digits):
+    def forward(self, segments, masks, claimed_digits, seq_mask=None):
         """
-        segments: (B, 8, T, 5)
-        masks: (B, 8, T)
-        claimed_digits: (B, 8)
+        segments: (B, S, T, 5)
+        masks: (B, S, T)
+        claimed_digits: (B, S)
+        seq_mask: (B, S) — 1 for real digits, 0 for padding. Optional.
         Returns: (B, 1) sequence match logit
         """
         B, S, T, F = segments.shape
@@ -106,5 +107,13 @@ class SequenceVerifier(nn.Module):
         lip_embs = self.lip_encoder(segments_flat, masks_flat).view(B, S, -1)
         digit_embs = self.digit_embedding(claimed_digits)
         combined = torch.cat([lip_embs, digit_embs], dim=2)
-        per_digit_scores = self.digit_compare(combined).squeeze(-1)
-        return self.seq_agg(per_digit_scores)
+        per_digit_scores = self.digit_compare(combined).squeeze(-1)  # (B, S)
+
+        # Masked mean pooling over digits
+        if seq_mask is not None:
+            per_digit_scores = per_digit_scores * seq_mask
+            pooled = per_digit_scores.sum(dim=1, keepdim=True) / seq_mask.sum(dim=1, keepdim=True).clamp(min=1)
+        else:
+            pooled = per_digit_scores.mean(dim=1, keepdim=True)
+
+        return self.seq_agg(pooled)

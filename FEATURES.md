@@ -1,4 +1,4 @@
-# Lip Movement Feature Documentation
+# Lip Movement Feature
 
 ## Overview
 
@@ -78,26 +78,6 @@ The magnitude of the 2D velocity vector formed by the vertical aperture velocity
 
 **What it captures:** The **overall speed of lip movement** regardless of direction. High values indicate rapid articulatory transitions — plosive consonants (like /b/ in "8") produce sharp spikes, while sustained vowels show near-zero speed. By combining vertical and horizontal velocities into a single magnitude, this avoids redundancy while preserving the dynamic information. It captures how "active" the lips are at each moment without needing to distinguish the direction of movement.
 
----
-
-## Removed Features & Rationale
-
-### Outer Vertical Aperture (merged with Inner)
-Originally measured using outer lip landmarks 0→17. Removed because it tracks almost identically to the inner vertical aperture (landmarks 13→14) — the outer lip edges move in lockstep with the inner edges. The inner measurement is more speech-relevant as it captures the true oral opening, so we kept that one and renamed it simply "Vertical Aperture".
-
-### Aspect Ratio (removed)
-Originally $f_1 / f_2$. Removed because horizontal spread varies much less than vertical aperture during speech, making the ratio nearly identical to vertical aperture. Compactness ($f_5$) captures the round-vs-elongated distinction more robustly.
-
-### Outer Lip Area (removed)
-Originally the area of the outer lip polygon. Removed because it is highly correlated with Inner Lip Area — both grow and shrink together. Inner lip area is more speech-relevant as it measures the actual oral opening, ignoring lip thickness.
-
-### Corner Angle (removed)
-Originally the angle at the top lip center formed by the two mouth corners. Removed because it is largely a function of horizontal spread and vertical aperture already captured by $f_1$ and $f_2$, and provides little additional discriminative power.
-
-### Separate Vertical / Horizontal Velocities (merged)
-Originally two features: $df_1/dt$ and $df_2/dt$. Merged into a single **Lip Speed** ($f_6$) — the magnitude of the velocity vector. The direction of movement is less important than the overall articulatory activity, and keeping them separate added redundancy.
-
----
 
 ## Why Model as Time Series?
 
@@ -111,3 +91,12 @@ For example, saying "5" (/faɪv/) involves:
 This trajectory is distinct from "9" (/naɪn/), even though both contain the /aɪ/ diphthong, because the start and end configurations differ (nasal /n/ vs labiodental /f,v/).
 
 A single-frame snapshot cannot distinguish digits that share similar mouth shapes at some point during articulation. The **temporal pattern** — the sequence of shapes and the speed of transitions — is what makes each digit unique.
+
+
+# SEq2seq
+MT
+encoder-decoder
+Instance normalization = normalize the whole input to zero mean and 1 std deviation
+
+Tokenize ts: patchTSt paper
+ViT - 

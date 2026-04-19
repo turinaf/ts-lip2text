@@ -17,11 +17,11 @@ from collections import defaultdict
 
 # --- Configuration ---
 MODEL_PATH = 'data/face_landmarker.task'
-DATA_DIR = 'data/lipdata0405-filter'
+DATA_DIR = 'data/lipdata-digit'
 OUTPUT_DIR = 'processed_data'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-TEST_SPEAKER_RATIO = 0.2  # ~20% of speakers held out for test
+TEST_SPEAKER_RATIO = 0.1  # ~20% of speakers held out for test
 RANDOM_SEED = 42
 
 # Lip landmark indices
@@ -132,10 +132,22 @@ options = vision.FaceLandmarkerOptions(
 )
 detector = vision.FaceLandmarker.create_from_options(options)
 
-# Discover all speakers
-speakers = sorted([d for d in os.listdir(DATA_DIR)
-                    if os.path.isdir(os.path.join(DATA_DIR, d))])
-print(f"Found {len(speakers)} speakers")
+# Discover all speakers across subsets and collect (speaker, subset, speaker_dir) entries
+subsets = sorted([d for d in os.listdir(DATA_DIR)
+                  if os.path.isdir(os.path.join(DATA_DIR, d)) and d.startswith('subset_')])
+print(f"Found subsets: {subsets}")
+
+# Build a mapping: speaker -> list of (subset, speaker_dir)
+speaker_dirs_map = defaultdict(list)
+for subset in subsets:
+    subset_path = os.path.join(DATA_DIR, subset)
+    for spk in sorted(os.listdir(subset_path)):
+        spk_path = os.path.join(subset_path, spk)
+        if os.path.isdir(spk_path):
+            speaker_dirs_map[spk].append((subset, spk_path))
+
+speakers = sorted(speaker_dirs_map.keys())
+print(f"Found {len(speakers)} unique speakers across {len(subsets)} subsets")
 
 # Split speakers into train/test
 rng = np.random.RandomState(RANDOM_SEED)
@@ -147,71 +159,70 @@ print(f"Train speakers: {len(train_speakers)}, Test speakers: {len(test_speakers
 print(f"Test speakers: {sorted(test_speakers)}")
 
 # Storage: per-digit segments with metadata
-# Each sample: {features: (T, 5), digit_sequence: [str], speaker: str, video_id: str}
-# We store both:
-#   1) Full-video features + digit sequence (for sequence-level verification)
-#   2) Per-digit segments (for digit-level analysis)
-
 all_samples = []  # full video level
 failed_videos = []
 total_videos = 0
 
 for speaker in sorted(train_speakers | test_speakers):
-    speaker_dir = os.path.join(DATA_DIR, speaker)
-    lab_files = sorted(glob.glob(os.path.join(speaker_dir, '*.lab')))
-
-    for lab_path in lab_files:
-        base = lab_path.replace('.lab', '')
-        video_path = base + '.mp4'
-        video_id = os.path.basename(base)
-
-        if not os.path.exists(video_path):
-            failed_videos.append((video_id, "video not found"))
+    for subset, speaker_dir in speaker_dirs_map[speaker]:
+        lab_dir = os.path.join(speaker_dir, 'lab')
+        video_dir = os.path.join(speaker_dir, 'video')
+        if not os.path.isdir(lab_dir) or not os.path.isdir(video_dir):
             continue
+        lab_files = sorted(glob.glob(os.path.join(lab_dir, '*.lab')))
 
-        total_videos += 1
-        if total_videos % 50 == 0:
-            print(f"  Processing video {total_videos}...")
+        for lab_path in lab_files:
+            base_name = os.path.splitext(os.path.basename(lab_path))[0]
+            video_path = os.path.join(video_dir, base_name + '.mp4')
+            video_id = f"{subset}/{speaker}/{base_name}"
 
-        try:
-            all_lm, fps = extract_landmarks(video_path, detector)
-            if all_lm is None or len(all_lm) < 5:
-                failed_videos.append((video_id, "landmark extraction failed"))
+            if not os.path.exists(video_path):
+                failed_videos.append((video_id, "video not found"))
                 continue
 
-            features = compute_features(all_lm)
-            digit_seq, alignments = parse_annotation(lab_path, fps)
+            total_videos += 1
+            if total_videos % 50 == 0:
+                print(f"  Processing video {total_videos}...")
 
-            # Extract per-digit segments
-            digit_segments = []
-            valid = True
-            for sf, ef, digit in alignments:
-                sf_c = min(sf, features.shape[0])
-                ef_c = min(ef, features.shape[0])
-                if ef_c - sf_c < 2:
-                    valid = False
-                    break
-                digit_segments.append(features[sf_c:ef_c])
+            try:
+                all_lm, fps = extract_landmarks(video_path, detector)
+                if all_lm is None or len(all_lm) < 5:
+                    failed_videos.append((video_id, "landmark extraction failed"))
+                    continue
 
-            if not valid:
-                failed_videos.append((video_id, "segment too short"))
+                features = compute_features(all_lm)
+                digit_seq, alignments = parse_annotation(lab_path, fps)
+
+                # Extract per-digit segments
+                digit_segments = []
+                valid = True
+                for sf, ef, digit in alignments:
+                    sf_c = min(sf, features.shape[0])
+                    ef_c = min(ef, features.shape[0])
+                    if ef_c - sf_c < 2:
+                        valid = False
+                        break
+                    digit_segments.append(features[sf_c:ef_c])
+
+                if not valid:
+                    failed_videos.append((video_id, "segment too short"))
+                    continue
+
+                split = 'test' if speaker in test_speakers else 'train'
+                all_samples.append({
+                    'video_id': video_id,
+                    'speaker': speaker,
+                    'split': split,
+                    'digit_sequence': digit_seq,
+                    'full_features': features,          # (T_video, 5)
+                    'digit_segments': digit_segments,   # list of (T_digit, 5)
+                    'alignments': alignments,
+                    'fps': fps,
+                })
+
+            except Exception as e:
+                failed_videos.append((video_id, str(e)))
                 continue
-
-            split = 'test' if speaker in test_speakers else 'train'
-            all_samples.append({
-                'video_id': video_id,
-                'speaker': speaker,
-                'split': split,
-                'digit_sequence': digit_seq,
-                'full_features': features,          # (T_video, 5)
-                'digit_segments': digit_segments,   # list of (T_digit, 5)
-                'alignments': alignments,
-                'fps': fps,
-            })
-
-        except Exception as e:
-            failed_videos.append((video_id, str(e)))
-            continue
 
 print(f"\nProcessed {total_videos} videos total")
 print(f"Successful: {len(all_samples)}, Failed: {len(failed_videos)}")

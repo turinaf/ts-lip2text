@@ -134,12 +134,44 @@ class SequenceVerificationDataset(Dataset):
             f, m = self._pad_segment(seg)
             all_feats.append(f)
             all_masks.append(m)
+        n_digits = len(segments)
         return (
             torch.FloatTensor(np.array(all_feats)),
             torch.FloatTensor(np.array(all_masks)),
             torch.LongTensor(claimed_digits),
             torch.FloatTensor([label]),
+            n_digits,
         )
+
+
+def sequence_collate_fn(batch):
+    """Collate sequences with variable number of digits by padding to max in batch."""
+    max_digits = max(item[4] for item in batch)
+    T = batch[0][0].shape[1]
+    F = batch[0][0].shape[2]
+
+    batch_feats, batch_masks, batch_digits, batch_labels, batch_seq_masks = [], [], [], [], []
+    for feats, masks, digits, label, n_dig in batch:
+        pad_n = max_digits - n_dig
+        if pad_n > 0:
+            feats = torch.cat([feats, torch.zeros(pad_n, T, F)], dim=0)
+            masks = torch.cat([masks, torch.zeros(pad_n, T)], dim=0)
+            digits = torch.cat([digits, torch.zeros(pad_n, dtype=torch.long)], dim=0)
+        seq_mask = torch.zeros(max_digits)
+        seq_mask[:n_dig] = 1.0
+        batch_feats.append(feats)
+        batch_masks.append(masks)
+        batch_digits.append(digits)
+        batch_labels.append(label)
+        batch_seq_masks.append(seq_mask)
+
+    return (
+        torch.stack(batch_feats),
+        torch.stack(batch_masks),
+        torch.stack(batch_digits),
+        torch.stack(batch_labels),
+        torch.stack(batch_seq_masks),
+    )
 
 
 # --- Evaluation ---
@@ -150,12 +182,12 @@ def evaluate(model, loader, device):
 
     with torch.no_grad():
         for batch in tqdm(loader, desc='Testing', leave=False):
-            if len(batch[0].shape) == 3:
+            if len(batch) == 4:
                 feats, mask, digit, label = [b.to(device) for b in batch]
                 logits = model(feats, mask, digit)
             else:
-                segs, masks, digits, label = [b.to(device) for b in batch]
-                logits = model(segs, masks, digits)
+                segs, masks, digits, label, seq_mask = [b.to(device) for b in batch]
+                logits = model(segs, masks, digits, seq_mask)
 
             probs = torch.sigmoid(logits)
             all_labels.extend(label.cpu().numpy().flatten())
@@ -286,8 +318,9 @@ if __name__ == '__main__':
     else:
         test_ds = SequenceVerificationDataset(test_path)
 
+    collate_fn = sequence_collate_fn if args.mode == 'sequence' else None
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                             num_workers=0, pin_memory=True)
+                             num_workers=0, pin_memory=True, collate_fn=collate_fn)
     print(f"Test samples: {len(test_ds)}")
 
     # Evaluate
