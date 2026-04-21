@@ -35,7 +35,7 @@ N_FEATURES = 5          # lip features per frame
 EMBED_DIM = 64          # embedding dimension
 HIDDEN_DIM = 128        # GRU hidden dimension
 BATCH_SIZE = 64
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1e-4
 N_EPOCHS = 50
 NEG_RATIO = 1           # number of negative pairs per positive pair
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else
@@ -309,9 +309,9 @@ if __name__ == '__main__':
 
     collate_fn = sequence_collate_fn if args.mode == 'sequence' else None
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=0, pin_memory=True, collate_fn=collate_fn)
+                              num_workers=0, pin_memory=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                             num_workers=0, pin_memory=True, collate_fn=collate_fn)
+                             num_workers=0, pin_memory=False, collate_fn=collate_fn)
 
     print(f"Train: {len(train_ds)} pairs, Test: {len(test_ds)} pairs")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")

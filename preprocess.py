@@ -137,14 +137,15 @@ subsets = sorted([d for d in os.listdir(DATA_DIR)
                   if os.path.isdir(os.path.join(DATA_DIR, d)) and d.startswith('subset_')])
 print(f"Found subsets: {subsets}")
 
-# Build a mapping: speaker -> list of (subset, speaker_dir)
+# Build a mapping: unique_speaker_id (subset/speaker) -> list of (subset, speaker_dir)
 speaker_dirs_map = defaultdict(list)
 for subset in subsets:
     subset_path = os.path.join(DATA_DIR, subset)
     for spk in sorted(os.listdir(subset_path)):
         spk_path = os.path.join(subset_path, spk)
         if os.path.isdir(spk_path):
-            speaker_dirs_map[spk].append((subset, spk_path))
+            unique_speaker_id = f"{subset}/{spk}"  # Unique ID: subset/speaker_number
+            speaker_dirs_map[unique_speaker_id].append((subset, spk_path))
 
 speakers = sorted(speaker_dirs_map.keys())
 print(f"Found {len(speakers)} unique speakers across {len(subsets)} subsets")
