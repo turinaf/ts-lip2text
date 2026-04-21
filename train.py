@@ -37,7 +37,7 @@ N_FEATURES = 5          # lip features per frame
 EMBED_DIM = 64          # embedding dimension
 HIDDEN_DIM = 128        # GRU hidden dimension
 BATCH_SIZE = 64
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1e-4
 N_EPOCHS = 50
 NEG_RATIO = 1           # number of negative pairs per positive pair
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else
@@ -129,7 +129,7 @@ class SequenceVerificationDataset(Dataset):
                     if wrong_digits == digits:
                         wrong_digits[0] = (wrong_digits[0] + 1) % N_CLASSES
                 else:
-                    n_replace = self.rng.randint(2, 5)
+                    n_replace = self.rng.randint(2, min(5, len(wrong_digits)) + 1)
                     positions = self.rng.choice(len(wrong_digits), n_replace, replace=False)
                     for pos in positions:
                         wrong_digits[pos] = self.rng.choice(
@@ -162,12 +162,49 @@ class SequenceVerificationDataset(Dataset):
             all_feats.append(f)
             all_masks.append(m)
 
+        n_digits = len(segments)
         return (
-            torch.FloatTensor(np.array(all_feats)),
-            torch.FloatTensor(np.array(all_masks)),
-            torch.LongTensor(claimed_digits),
-            torch.FloatTensor([label]),
+            torch.FloatTensor(np.array(all_feats)),   # (n_digits, T, 5)
+            torch.FloatTensor(np.array(all_masks)),    # (n_digits, T)
+            torch.LongTensor(claimed_digits),          # (n_digits,)
+            torch.FloatTensor([label]),                # (1,)
+            n_digits,                                  # int
         )
+
+
+def sequence_collate_fn(batch):
+    """Collate sequences with variable number of digits by padding to max in batch."""
+    max_digits = max(item[4] for item in batch)
+    T = batch[0][0].shape[1]
+    F = batch[0][0].shape[2]
+
+    batch_feats = []
+    batch_masks = []
+    batch_digits = []
+    batch_labels = []
+    batch_seq_masks = []
+
+    for feats, masks, digits, label, n_dig in batch:
+        pad_n = max_digits - n_dig
+        if pad_n > 0:
+            feats = torch.cat([feats, torch.zeros(pad_n, T, F)], dim=0)
+            masks = torch.cat([masks, torch.zeros(pad_n, T)], dim=0)
+            digits = torch.cat([digits, torch.zeros(pad_n, dtype=torch.long)], dim=0)
+        seq_mask = torch.zeros(max_digits)
+        seq_mask[:n_dig] = 1.0
+        batch_feats.append(feats)
+        batch_masks.append(masks)
+        batch_digits.append(digits)
+        batch_labels.append(label)
+        batch_seq_masks.append(seq_mask)
+
+    return (
+        torch.stack(batch_feats),      # (B, S_max, T, F)
+        torch.stack(batch_masks),      # (B, S_max, T)
+        torch.stack(batch_digits),     # (B, S_max)
+        torch.stack(batch_labels),     # (B, 1)
+        torch.stack(batch_seq_masks),  # (B, S_max)
+    )
 
 
 # --- Training ---
@@ -178,12 +215,12 @@ def train_epoch(model, loader, optimizer, criterion, device):
 
     pbar = tqdm(loader, desc='Train', leave=False)
     for batch in pbar:
-        if len(batch[0].shape) == 3:
+        if len(batch) == 4:
             feats, mask, digit, label = [b.to(device) for b in batch]
             logits = model(feats, mask, digit)
         else:
-            segs, masks, digits, label = [b.to(device) for b in batch]
-            logits = model(segs, masks, digits)
+            segs, masks, digits, label, seq_mask = [b.to(device) for b in batch]
+            logits = model(segs, masks, digits, seq_mask)
 
         loss = criterion(logits, label)
         optimizer.zero_grad()
@@ -203,12 +240,12 @@ def evaluate(model, loader, device):
 
     with torch.no_grad():
         for batch in tqdm(loader, desc='Eval', leave=False):
-            if len(batch[0].shape) == 3:
+            if len(batch) == 4:
                 feats, mask, digit, label = [b.to(device) for b in batch]
                 logits = model(feats, mask, digit)
             else:
-                segs, masks, digits, label = [b.to(device) for b in batch]
-                logits = model(segs, masks, digits)
+                segs, masks, digits, label, seq_mask = [b.to(device) for b in batch]
+                logits = model(segs, masks, digits, seq_mask)
 
             probs = torch.sigmoid(logits)
             all_labels.extend(label.cpu().numpy().flatten())
@@ -417,11 +454,11 @@ if __name__ == '__main__':
         test_ds = CTCDataset(test_path)
         model = CTCLipReader(n_features=N_FEATURES, hidden_dim=HIDDEN_DIM).to(DEVICE)
 
-    collate_fn = ctc_collate if args.mode == 'ctc' else None
+    collate_fn = sequence_collate_fn if args.mode == 'sequence' else None
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=0, pin_memory=True, collate_fn=collate_fn)
+                              num_workers=0, pin_memory=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                             num_workers=0, pin_memory=True, collate_fn=collate_fn)
+                             num_workers=0, pin_memory=False, collate_fn=collate_fn)
 
     print(f"Train: {len(train_ds)} samples, Test: {len(test_ds)} samples")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
