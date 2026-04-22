@@ -2,6 +2,7 @@ data/
 *.zip
 *.mp4
 .DS_Store/
+.DS_Store
 output/
 processed_data/
 runs/
