@@ -31,7 +31,7 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 # Hyperparameters
 MAX_SEQ_LEN = 30        # max frames per digit segment (pad/truncate)
-N_FEATURES = 5          # lip features per frame
+N_FEATURES = 7          # lip features per frame
 EMBED_DIM = 64          # embedding dimension
 HIDDEN_DIM = 128        # GRU hidden dimension
 BATCH_SIZE = 64
