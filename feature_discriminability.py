@@ -88,7 +88,7 @@ def mutual_information(segments_by_digit):
 
     mi = mutual_info_classif(X, y, discrete_features=False, random_state=42)
     # Average MI over the mean and std halves
-    mi_per_feature = (mi[:5] + mi[5:]) / 2
+    mi_per_feature = (mi[:N_FEATURES] + mi[N_FEATURES:]) / 2
     return mi_per_feature
 
 

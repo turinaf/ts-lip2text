@@ -32,12 +32,14 @@ INNER_LIP = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308,
 
 IDX_TOP_INNER = 13
 IDX_BOTTOM_INNER = 14
+IDX_TOP_OUTER = 0
+IDX_BOTTOM_OUTER = 17
 IDX_LEFT_CORNER = 61
 IDX_RIGHT_CORNER = 291
 LEFT_EYE_OUTER = 33
 RIGHT_EYE_OUTER = 263
 
-FEATURE_NAMES = ['vert_aperture', 'horiz_spread', 'inner_area', 'compactness', 'lip_speed']
+FEATURE_NAMES = ['vert_aperture', 'outer_vert_aperture', 'horiz_spread', 'inner_area', 'outer_area', 'compactness', 'lip_speed']
 
 
 # --- Feature extraction functions ---
@@ -87,11 +89,15 @@ def compute_features(all_lm):
     vert_ap = np.linalg.norm(
         all_lm[:, IDX_TOP_INNER] - all_lm[:, IDX_BOTTOM_INNER], axis=1
     ) / interocular
+    outer_vert_ap = np.linalg.norm(
+        all_lm[:, IDX_TOP_OUTER] - all_lm[:, IDX_BOTTOM_OUTER], axis=1
+    ) / interocular
     horiz_sp = np.linalg.norm(
         all_lm[:, IDX_LEFT_CORNER] - all_lm[:, IDX_RIGHT_CORNER], axis=1
     ) / interocular
 
     inner_areas = np.zeros(num_frames)
+    outer_areas = np.zeros(num_frames)
     compactness = np.zeros(num_frames)
     for i in range(num_frames):
         lm = all_lm[i]
@@ -99,13 +105,14 @@ def compute_features(all_lm):
         oa = polygon_area(lm[OUTER_LIP])
         op = polygon_perimeter(lm[OUTER_LIP])
         inner_areas[i] = ia / (interocular[i] ** 2)
+        outer_areas[i] = oa / (interocular[i] ** 2)
         compactness[i] = (4 * np.pi * oa) / (op ** 2 + 1e-8)
 
     vv = np.gradient(vert_ap)
     hv = np.gradient(horiz_sp)
     lip_speed = np.sqrt(vv ** 2 + hv ** 2)
 
-    return np.column_stack([vert_ap, horiz_sp, inner_areas, compactness, lip_speed])
+    return np.column_stack([vert_ap, outer_vert_ap, horiz_sp, inner_areas, outer_areas, compactness, lip_speed])
 
 def parse_annotation(lab_path, fps):
     with open(lab_path) as f:
@@ -215,8 +222,8 @@ for speaker in sorted(train_speakers | test_speakers):
                     'speaker': speaker,
                     'split': split,
                     'digit_sequence': digit_seq,
-                    'full_features': features,          # (T_video, 5)
-                    'digit_segments': digit_segments,   # list of (T_digit, 5)
+                    'full_features': features,          # (T_video, 7)
+                    'digit_segments': digit_segments,   # list of (T_digit, 7)
                     'alignments': alignments,
                     'fps': fps,
                 })
