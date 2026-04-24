@@ -13,14 +13,13 @@ import os
 import json
 import argparse
 
-from model import (DigitVerifier, SequenceVerifier, CTCLipReader,
-                   CHAR_TO_IDX, VOCAB, N_CLASSES, CTC_BLANK)
+from model import (DigitVerifier, SequenceVerifier,
+                   CHAR_TO_IDX, VOCAB, N_CLASSES)
 
 # --- Configuration ---
 PROCESSED_DIR = 'processed_data'
 MODEL_DIR = 'models'
 MAX_SEQ_LEN = 30
-MAX_VIDEO_LEN = 150
 N_FEATURES = 5
 EMBED_DIM = 64
 HIDDEN_DIM = 128
@@ -278,8 +277,8 @@ def print_results(metrics, digit_stats=None):
 # --- Main ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test lip-text verification model')
-    parser.add_argument('--mode', choices=['digit', 'sequence', 'ctc'], default='sequence',
-                        help='digit: per-digit, sequence: full 8-digit, ctc: alignment-free')
+    parser.add_argument('--mode', choices=['digit', 'sequence'], default='sequence',
+                        help='digit: per-digit, sequence: full 8-digit')
     parser.add_argument('--model_path', type=str, default=None,
                         help='Path to model checkpoint (default: models/best_{mode}_verifier.pt)')
     parser.add_argument('--batch_size', type=int, default=64)
@@ -307,85 +306,15 @@ if __name__ == '__main__':
     if args.mode == 'digit':
         model = DigitVerifier(n_classes=N_CLASSES, embed_dim=EMBED_DIM,
                               n_features=N_FEATURES, hidden_dim=HIDDEN_DIM).to(DEVICE)
-    elif args.mode == 'sequence':
+    else:
         model = SequenceVerifier(n_classes=N_CLASSES, embed_dim=EMBED_DIM,
                                  n_features=N_FEATURES, hidden_dim=HIDDEN_DIM).to(DEVICE)
-    else:  # ctc
-        model = CTCLipReader(n_features=N_FEATURES, hidden_dim=HIDDEN_DIM).to(DEVICE)
 
     model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Load test data
-    if args.mode == 'ctc':
-        from train import CTCDataset, ctc_collate, evaluate_ctc
-        test_ds = CTCDataset(test_path)
-        test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                                 num_workers=0, pin_memory=True, collate_fn=ctc_collate)
-        print(f"Test samples: {len(test_ds)}")
-
-        # CTC evaluation
-        metrics = evaluate_ctc(model, test_loader, DEVICE)
-
-        print(f"\n{'='*60}")
-        print(f"  CTC TEST RESULTS")
-        print(f"{'='*60}")
-        print(f"  Sequence accuracy:   {metrics['seq_accuracy']:.4f}")
-        print(f"  Char error rate:     {metrics['char_error_rate']:.4f}")
-        print(f"  Correct sequences:   {metrics['n_correct']} / {metrics['n_sequences']}")
-        print(f"{'='*60}")
-
-        # Per-digit confusion matrix
-        print(f"\n  Per-digit recognition analysis:")
-        data = np.load(test_path, allow_pickle=True)
-        all_pred, all_true = [], []
-        model.eval()
-        with torch.no_grad():
-            for feats, lengths, targets, target_lengths in tqdm(test_loader, desc='Decode', leave=False):
-                feats = feats.to(DEVICE)
-                lengths = lengths.to(DEVICE)
-                logits = model(feats, lengths)
-                decoded = model.decode_batch(logits, lengths)
-                offset = 0
-                for i in range(feats.size(0)):
-                    tlen = target_lengths[i].item()
-                    target_seq = targets[offset:offset+tlen].tolist()
-                    offset += tlen
-                    pred_seq = decoded[i]
-                    # Align by position (pad shorter with -1)
-                    max_len = max(len(pred_seq), len(target_seq))
-                    for j in range(max_len):
-                        t = target_seq[j] if j < len(target_seq) else -1
-                        p = pred_seq[j] if j < len(pred_seq) else -1
-                        if t >= 0 and p >= 0:
-                            all_true.append(t)
-                            all_pred.append(p)
-
-        if all_true:
-            cm = confusion_matrix(all_true, all_pred, labels=list(range(N_CLASSES)))
-            print(f"\n  Confusion matrix (row=true, col=predicted):")
-            header = '      ' + ' '.join(f'{VOCAB[i]:>4}' for i in range(N_CLASSES))
-            print(header)
-            for i in range(N_CLASSES):
-                row = f'  {VOCAB[i]:>3} ' + ' '.join(f'{cm[i][j]:>4}' for j in range(N_CLASSES))
-                print(row)
-            print()
-
-        if args.save:
-            output = {
-                'mode': 'ctc', 'model_path': model_path, 'metrics': metrics,
-            }
-            if all_true:
-                output['confusion_matrix'] = cm.tolist()
-            out_path = os.path.join(MODEL_DIR, f'test_results_ctc.json')
-            with open(out_path, 'w') as f:
-                json.dump(output, f, indent=2,
-                          default=lambda o: float(o) if isinstance(o, np.floating) else str(o))
-            print(f"Results saved to {out_path}")
-
-        exit(0)
-
-    elif args.mode == 'digit':
+    if args.mode == 'digit':
         test_ds = LipVerificationDataset(test_path)
     else:
         test_ds = SequenceVerificationDataset(test_path)

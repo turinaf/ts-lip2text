@@ -4,8 +4,6 @@ Lip-Text Verification Models
 LipEncoder: 1D-CNN + BiGRU encoder for lip segment time series
 DigitVerifier: per-digit verification (lip segment vs single digit)
 SequenceVerifier: full 8-digit sequence verification
-CTCLipReader: CTC-based model that aligns full video to digit sequence
-              without requiring pre-segmentation
 """
 import torch
 import torch.nn as nn
