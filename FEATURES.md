@@ -100,3 +100,38 @@ Instance normalization = normalize the whole input to zero mean and 1 std deviat
 
 Tokenize ts: patchTSt paper
 ViT - 
+
+
+
+- **Normalization (general):** Distances scale as length (L) and areas as L^2. The inter-ocular distance $d_{\text{eye}}$ is a linear scale estimate, so divide:
+  - distances by $d_{\text{eye}}$ to get scale-invariant, unitless values (e.g., `f1`, `f2`);
+  - areas by $d_{\text{eye}}^2$ to remove quadratic scaling (e.g., `f3`).  
+  This is pure dimensional analysis: dividing an area by a length gives wrong units, so you must divide by length squared for a dimensionless area measure.
+
+- **`f_1` Vertical aperture and `f_2` Horizontal spread:** Both are Euclidean distances ($\|p_a-p_b\|$) normalized by $d_{\text{eye}}$. Rationale:
+  - Euclidean distance is the natural metric for landmark separation.
+  - Normalizing by $d_{\text{eye}}$ removes subject/camera scale differences so features reflect shape not size.
+  - Using inner-lip points for aperture targets the actual oral opening (physiologically relevant); mouth-corner points for spread capture lateral stretch.
+
+- **`f_3` Inner lip area (Shoelace) and why squared normalization:** Area for a polygon via the Shoelace formula is in units L^2. To make it comparable across subjects/recordings you compute
+  $$f_3 = \frac{A_{\text{inner}}}{d_{\text{eye}}^2}.$$
+  The squared denominator is necessary because area scales with the square of linear dimensions; this produces a dimensionless, scale-invariant area feature.
+
+- **`f_4` Compactness / circularity:**
+  - Formula: $f_4 = \dfrac{4\pi\,A_{\text{outer}}}{P_{\text{outer}}^2}$.
+  - Why $P^2$ in denominator: dimensions—area has units L^2 and perimeter squared is (L)^2, so $A/P^2$ is dimensionless. That is required for a pure shape descriptor independent of scale.
+  - Why multiply by $4\pi$: it normalizes the quantity so a perfect circle yields exactly 1. Proof: circle area $A=\pi r^2$, perimeter $P=2\pi r$ → substitute gives $(4\pi \cdot \pi r^2)/(4\pi^2 r^2)=1$. Thus the factor sets the upper bound and makes interpretation easier (1 = circle, closer to 0 = elongated/irregular).
+  - Interpretation: it is the classical isoperimetric quotient — a compactness measure robustly distinguishing round vs elongated shapes while being rotation- and scale-invariant. (Practical note: perimeter estimates are sensitive to small boundary jitter; smoothing or using polygonal perimeter helps.)
+
+- **`f_5` Lip speed (sqrt of sum squares of derivatives):**
+  - Formula: $f_5 = \sqrt{\left(\frac{d f_1}{dt}\right)^2 + \left(\frac{d f_2}{dt}\right)^2}$.
+  - Why square and sqrt: this is the Euclidean (L2) norm of the velocity vector $v=(\dot f_1,\dot f_2)$. Squaring then summing yields the squared magnitude; the square root returns the actual magnitude (speed). That gives a positive scalar representing instantaneous lip motion magnitude regardless of direction.
+  - Why operate on `f1`,`f2` (normalized features): derivatives of normalized measures remain scale-invariant; if you differentiated raw pixel coords you'd conflate camera distance changes with motion.
+  - Implementation note: finite differences (e.g., `np.gradient`) approximate $\dot f$, and if you need physical units convert per-frame to per-second by dividing by frame period.
+
+- **Practical and interpretability notes (short):**
+  - Dimensionless features (from the normalization rules above) allow consistent weighting and learning across subjects and recording conditions.
+  - Compactness is sensitive to noise in perimeter; area is more robust but ignores boundary complexity—use both for complementary information.
+  - `f_5` (L2 speed) compresses 2D motion into one scalar; if direction matters, keep components separately or use angular measures.
+  - If frames-per-second varies, rescale derivatives to seconds for comparability.
+

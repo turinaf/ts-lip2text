@@ -6,9 +6,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # --- 1. Configuration ---
-video_path = 'data/lipdata0405-filter/1003/1003_20161115142134_35396787.mp4'
+video_path = 'data/lipdata-digit/subset_05/1003/video/1003_20161115142134_35396787.mp4'
 model_path = 'data/face_landmarker.task'
-annotation_path = 'data/lipdata0405-filter/1003/1003_20161115142134_35396787.lab'
+annotation_path = 'data/lipdata-digit/subset_05/1003/lab/1003_20161115142134_35396787.lab'
 
 # Lip landmark indices (MediaPipe face mesh)
 OUTER_LIP = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291,
