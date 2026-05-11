@@ -10,6 +10,7 @@ Usage:
     python inference.py --video path/to/video.mp4 --digits "1 3 5 7 9 2 4 6" --mode digit
 """
 import cv2
+import librosa
 import mediapipe as mp_lib
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -25,7 +26,7 @@ from model import (DigitVerifier, SequenceVerifier,
 FACE_MODEL_PATH = 'data/face_landmarker.task'
 MODEL_DIR = 'models'
 MAX_SEQ_LEN = 30
-N_FEATURES = 5
+N_FEATURES = 8  # 7 lip features + rms_energy
 EMBED_DIM = 64
 HIDDEN_DIM = 128
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else
@@ -88,6 +89,19 @@ def extract_landmarks(video_path, detector):
         raise RuntimeError(f"No frames extracted from {video_path}")
 
     return np.array(landmarks_list), fps
+
+
+def extract_rms_from_video(video_path, num_frames, fps):
+    """Extract per-video-frame RMS energy from the audio track of an mp4."""
+    try:
+        y, sr = librosa.load(video_path, sr=None, mono=True)
+        hop_length = max(1, int(sr / fps))
+        rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+        audio_times = np.arange(len(rms)) * hop_length / sr
+        video_times = np.arange(num_frames) / fps
+        return np.interp(video_times, audio_times, rms)
+    except Exception:
+        return np.zeros(num_frames, dtype=np.float32)
 
 
 def compute_features(all_lm):
@@ -303,6 +317,8 @@ if __name__ == '__main__':
     print(f"  {num_frames} frames @ {fps:.1f} FPS")
 
     features = compute_features(all_lm)
+    rms = extract_rms_from_video(args.video, num_frames, fps)
+    features = np.column_stack([features, rms])
     print(f"  Features shape: {features.shape}")
 
     # 3. Parse digits and segment
