@@ -45,10 +45,11 @@ Each video contains a person reading **8 Chinese digits** (vocabulary: 0-9 and `
 
 ## Model Architecture
 
-Two verification modes:
+Two verification modes, plus one transcription mode:
 
 - **Sequence-level** (`--mode sequence`, recommended): Encodes all 8 digit segments with a shared encoder, compares each against its claimed digit embedding, aggregates into a single match/mismatch decision.
 - **Digit-level** (`--mode digit`): Verifies each lip segment against a single claimed digit independently.
+- **Seq2seq transcription** (`--mode seq2seq`): Tiny Transformer encoder-decoder that predicts the digit string directly from the segment sequence.
 
 Architecture: `Conv1D x2 → BatchNorm → ReLU → Bidirectional GRU → Masked Mean Pooling → FC`. See [PIPELINE.md](PIPELINE.md) for full details.
 
@@ -70,6 +71,9 @@ python train.py --mode sequence --epochs 50
 
 # Digit-level verifier
 python train.py --mode digit --epochs 50
+
+# Seq2seq transcription model
+python train.py --mode seq2seq --epochs 50
 
 # Custom hyperparameters
 python train.py --mode sequence --epochs 100 --lr 5e-4 --batch_size 32
@@ -110,8 +114,11 @@ python inference.py --video path/to/video.mp4 --digits "1 3 5 7 9 2 4 6"
 # Per-digit mode
 python inference.py --video path/to/video.mp4 --lab path/to/file.lab --mode digit
 
-# Custom threshold
-python inference.py --video path/to/video.mp4 --digits "1 3 5 7 9 2 4 6" --threshold 0.6
+# Seq2seq transcription
+python inference.py --video path/to/video.mp4 --mode seq2seq --lab path/to/file.lab
+
+# Seq2seq transcription with auto-segmentation length
+python inference.py --video path/to/video.mp4 --mode seq2seq --n_digits 8
 ```
 
 ## File Structure

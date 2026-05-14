@@ -295,28 +295,31 @@ if __name__ == '__main__':
     if args.mode == 'digit':
         train_ds = LipVerificationDataset(train_path)
         test_ds = LipVerificationDataset(test_path, seed=99)
+        n_features = train_ds.n_features
         model = DigitVerifier(
             n_classes=N_CLASSES,
             embed_dim=EMBED_DIM,
-            n_features=N_FEATURES,
+            n_features=n_features,
             hidden_dim=HIDDEN_DIM,
         ).to(DEVICE)
     elif args.mode == 'sequence':
         train_ds = SequenceVerificationDataset(train_path)
         test_ds = SequenceVerificationDataset(test_path, seed=99)
+        n_features = train_ds.n_features
         model = SequenceVerifier(
             n_classes=N_CLASSES,
             embed_dim=EMBED_DIM,
-            n_features=N_FEATURES,
+            n_features=n_features,
             hidden_dim=HIDDEN_DIM,
         ).to(DEVICE)
     else:
         train_ds = LipTranscriptionDataset(train_path)
         test_ds = LipTranscriptionDataset(test_path)
+        n_features = train_ds.n_features
         model = TinyLipSeq2Seq(
             vocab_size=SEQ2SEQ_VOCAB_SIZE,
             pad_idx=PAD_IDX,
-            n_features=N_FEATURES,
+            n_features=n_features,
             seg_embed_dim=48,
             n_heads=4,
             n_encoder_layers=1,
@@ -352,6 +355,7 @@ if __name__ == '__main__':
     )
 
     print(f'Train: {len(train_ds)} samples, Test: {len(test_ds)} samples')
+    print(f'Feature dim: {n_features}')
     print(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')
 
     criterion = (
