@@ -11,3 +11,5 @@ __pycache__/
 plots/
 .vscode/
 .claude/
+.agents/
+csv/
