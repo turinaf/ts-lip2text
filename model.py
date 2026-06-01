@@ -159,6 +159,11 @@ class TinyLipSeq2Seq(nn.Module):
             dropout=dropout,
             batch_first=True,
         )
+        # MPS currently lacks the nested-tensor op used by the encoder fast path.
+        # Keep masking behavior but force the regular code path on Apple Silicon.
+        if torch.backends.mps.is_available():
+            self.transformer.encoder.enable_nested_tensor = False
+            self.transformer.encoder.use_nested_tensor = False
         self.out = nn.Linear(seg_embed_dim, vocab_size)
 
     @staticmethod

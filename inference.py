@@ -347,11 +347,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Lip-text verification inference')
     parser.add_argument('--video', type=str, required=True,
                         help='Path to input video file')
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--digits', type=str,
-                       help='Claimed digit string, space-separated (e.g. "1 3 5 7 9 2 4 6")')
-    group.add_argument('--lab', type=str,
-                       help='Path to .lab annotation file (contains digits + time ranges)')
+    parser.add_argument('--digits', type=str,
+                        help='Claimed digit string, space-separated (e.g. "1 3 5 7 9 2 4 6")')
+    parser.add_argument('--lab', type=str,
+                        help='Path to .lab annotation file (contains digits + time ranges)')
     parser.add_argument('--mode', choices=['digit', 'sequence', 'seq2seq'], default='sequence',
                         help='Verification mode (default: sequence)')
     parser.add_argument('--n_digits', type=int, default=None,
@@ -361,6 +360,18 @@ if __name__ == '__main__':
     parser.add_argument('--face_model', type=str, default=FACE_MODEL_PATH,
                         help=f'Path to face landmarker model (default: {FACE_MODEL_PATH})')
     args = parser.parse_args()
+
+    if args.mode == 'seq2seq':
+        if args.lab is None and args.n_digits is None:
+            print('ERROR: seq2seq inference needs --lab or --n_digits to define segmentation length')
+            exit(1)
+    else:
+        if args.lab is None and args.digits is None:
+            print('ERROR: verification modes need --digits or --lab')
+            exit(1)
+        if args.lab is not None and args.digits is not None:
+            print('ERROR: provide only one of --digits or --lab')
+            exit(1)
 
     default_model_name = {
         'digit': 'best_digit_verifier.pt',
@@ -402,6 +413,7 @@ if __name__ == '__main__':
     print(f"  Features shape: {features.shape}")
 
     # 3. Parse digits and segment
+    digits = None
     if args.lab:
         digits, alignments = parse_lab_file(args.lab, fps)
         segments = segment_by_time(features, alignments, num_frames)
@@ -425,10 +437,8 @@ if __name__ == '__main__':
     state_dict = torch.load(model_path, map_location=DEVICE, weights_only=True)
     n_features = infer_input_feature_dim(state_dict)
     features = adapt_feature_dim(features, n_features)
-    if args.lab:
-        segments = [adapt_feature_dim(seg, n_features) for seg in segments]
-    else:
-        segments = [adapt_feature_dim(seg, n_features) for seg in segments]
+    segments = [adapt_feature_dim(seg, n_features) for seg in segments]
+    n_digits = infer_n_digits_from_segments(segments)
 
     if digits is not None:
         # Validate digits when a claimed sequence is available.

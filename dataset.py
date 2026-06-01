@@ -7,6 +7,7 @@ from model import CHAR_TO_IDX, N_CLASSES
 
 MAX_SEQ_LEN = 30
 NEG_RATIO = 1
+EXPECTED_N_DIGITS = 8
 
 
 
@@ -23,6 +24,21 @@ def _infer_n_features(digit_segments):
     raise ValueError('Could not infer feature dimension from dataset')
 
 
+def _filter_fixed_length_samples(digit_segments, digit_sequences, expected_len=EXPECTED_N_DIGITS):
+    """Keep only samples where both sequence and segment count match expected length."""
+    keep_idx = []
+    for i, (segs, seq) in enumerate(zip(digit_segments, digit_sequences)):
+        if len(segs) == expected_len and len(seq) == expected_len:
+            keep_idx.append(i)
+
+    if not keep_idx:
+        raise ValueError(
+            f'No samples with exactly {expected_len} digits found after filtering'
+        )
+
+    return digit_segments[keep_idx], digit_sequences[keep_idx]
+
+
 # --- Dataset ---
 class LipVerificationDataset(Dataset):
     """
@@ -34,6 +50,9 @@ class LipVerificationDataset(Dataset):
         data = np.load(npz_path, allow_pickle=True)
         self.digit_segments = data['digit_segments']
         self.digit_sequences = data['digit_sequences']
+        self.digit_segments, self.digit_sequences = _filter_fixed_length_samples(
+            self.digit_segments, self.digit_sequences
+        )
         self.max_seq_len = max_seq_len
         self.rng = np.random.RandomState(seed)
         self.n_features = _infer_n_features(self.digit_segments)
@@ -88,6 +107,9 @@ class SequenceVerificationDataset(Dataset):
         data = np.load(npz_path, allow_pickle=True)
         self.digit_segments = data['digit_segments']
         self.digit_sequences = data['digit_sequences']
+        self.digit_segments, self.digit_sequences = _filter_fixed_length_samples(
+            self.digit_segments, self.digit_sequences
+        )
         self.max_seg_len = max_seg_len
         self.rng = np.random.RandomState(seed)
         self.n_videos = len(self.digit_segments)
@@ -157,6 +179,9 @@ class LipTranscriptionDataset(Dataset):
         data = np.load(npz_path, allow_pickle=True)
         self.digit_segments = data['digit_segments']
         self.digit_sequences = data['digit_sequences']
+        self.digit_segments, self.digit_sequences = _filter_fixed_length_samples(
+            self.digit_segments, self.digit_sequences
+        )
         self.max_seg_len = max_seg_len
         self.n_features = _infer_n_features(self.digit_segments)
 
