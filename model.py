@@ -22,15 +22,19 @@ class LipEncoder(nn.Module):
     def __init__(self, n_features=5, hidden_dim=128, embed_dim=64):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv1d(n_features, 32, kernel_size=3, padding=1),
+            nn.Conv1d(n_features, 32, kernel_size=3, padding=1),          # dilation=1
             nn.BatchNorm1d(32),
             nn.ReLU(),
-            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.Conv1d(32, 64, kernel_size=3, padding=2, dilation=2),      # dilation=2
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Conv1d(64, 64, kernel_size=3, padding=4, dilation=4),      # dilation=4
             nn.BatchNorm1d(64),
             nn.ReLU(),
         )
         self.gru = nn.GRU(64, hidden_dim, batch_first=True, bidirectional=True)
         self.fc = nn.Linear(hidden_dim * 2, embed_dim)
+        self.attn = nn.Linear(hidden_dim * 2, 1)  # add to __init__
 
     def forward(self, x, mask):
         """
@@ -43,7 +47,10 @@ class LipEncoder(nn.Module):
 
         # Masked mean pooling
         mask_exp = mask.unsqueeze(-1)         # (B, T, 1)
-        h = (h * mask_exp).sum(dim=1) / (mask_exp.sum(dim=1) + 1e-8)
+        attn_w = self.attn(h).squeeze(-1)          # (B, T)
+        attn_w = attn_w.masked_fill(~mask.bool(), float('-inf'))
+        attn_w = torch.softmax(attn_w, dim=1).unsqueeze(-1)
+        h = (h * attn_w).sum(dim=1)               # (B, hidden*2)
         return self.fc(h)                     # (B, embed_dim)
 
 
@@ -54,7 +61,7 @@ class DigitVerifier(nn.Module):
         self.lip_encoder = LipEncoder(n_features, hidden_dim, embed_dim)
         self.digit_embedding = nn.Embedding(n_classes, embed_dim)
         self.classifier = nn.Sequential(
-            nn.Linear(embed_dim * 2, 64),
+            nn.Linear(embed_dim * 4, 64),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(64, 1),
@@ -69,7 +76,9 @@ class DigitVerifier(nn.Module):
         """
         lip_emb = self.lip_encoder(lip_features, mask)
         digit_emb = self.digit_embedding(claimed_digit.squeeze(1))
-        combined = torch.cat([lip_emb, digit_emb], dim=1)
+        diff = lip_emb - digit_emb
+        prod = lip_emb * digit_emb
+        combined = torch.cat([lip_emb, digit_emb, diff, prod], dim=1)
         return self.classifier(combined)
 
 
@@ -89,11 +98,8 @@ class SequenceVerifier(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(64, 1),
         )
-        self.seq_agg = nn.Sequential(
-            nn.Linear(1, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-        )
+        self.seq_agg = nn.GRU(1, 32, batch_first=True)
+        self.seq_out = nn.Linear(32, 1)
 
     def forward(self, segments, masks, claimed_digits, seq_mask=None):
         """
@@ -118,7 +124,9 @@ class SequenceVerifier(nn.Module):
         else:
             pooled = per_digit_scores.mean(dim=1, keepdim=True)
 
-        return self.seq_agg(pooled)
+        scores_input = per_digit_scores.unsqueeze(-1)  # (B, S, 1)
+        _, h = self.seq_agg(scores_input)                 # h: (1, B, 32)
+        return self.seq_out(h.squeeze(0))
 
 
 class TinyLipSeq2Seq(nn.Module):
