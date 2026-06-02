@@ -80,6 +80,23 @@ data/
     ...
 ```
 
+GRID layout (supported via `--dataset grid`):
+
+```text
+../liptev/data/grid/
+  s10_processed/
+    align/*.align
+    audio/*.wav
+    video/*.mp4          # ignored for feature extraction
+
+../data/
+  s10_processed/
+    *.mpg                # used as uncropped input video
+```
+
+For GRID, alignment/audio are read from `../liptev/data/grid/sXX_processed`, and
+the video is resolved from `../data/sXX_processed/<same_basename>.mpg`.
+
 ## Installation
 
 Python 3.10+ is recommended.
@@ -94,6 +111,12 @@ pip install numpy torch torchvision torchaudio opencv-python mediapipe librosa s
 
 ```bash
 python preprocess.py
+
+# GRID (single speaker example: s10)
+python preprocess.py --dataset grid --grid-speakers s10
+
+# GRID (all speakers found under ../liptev/data/grid)
+python preprocess.py --dataset grid
 ```
 
 This generates:

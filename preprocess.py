@@ -14,13 +14,15 @@ import numpy as np
 import os
 import glob
 import json
+import argparse
 from collections import defaultdict
 
 # --- Configuration ---
 MODEL_PATH = 'data/face_landmarker.task'
-DATA_DIR = 'data/lipdata-digit'
-OUTPUT_DIR = 'processed_data'
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+DEFAULT_DIGIT_DATA_DIR = 'data/lipdata-digit'
+DEFAULT_GRID_PROCESSED_ROOT = '../liptev/data/grid'
+DEFAULT_GRID_ORIGINAL_ROOT = '../data'
+DEFAULT_OUTPUT_DIR = 'processed_data'
 
 TEST_SPEAKER_RATIO = 0.1  # ~20% of speakers held out for test
 RANDOM_SEED = 42
@@ -41,6 +43,27 @@ LEFT_EYE_OUTER = 33
 RIGHT_EYE_OUTER = 263
 
 FEATURE_NAMES = ['vert_aperture', 'outer_vert_aperture', 'horiz_spread', 'inner_area', 'outer_area', 'compactness', 'lip_speed', 'rms_energy']
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Preprocess digit or GRID lipreading datasets.')
+    parser.add_argument('--dataset', choices=['digit', 'grid'], default='digit', help='Dataset format to preprocess.')
+    parser.add_argument('--output-dir', default=DEFAULT_OUTPUT_DIR, help='Output directory for train/test .npz and metadata.')
+    parser.add_argument('--test-speaker-ratio', type=float, default=TEST_SPEAKER_RATIO, help='Speaker-level test split ratio.')
+    parser.add_argument('--seed', type=int, default=RANDOM_SEED, help='Random seed for speaker split.')
+
+    # Digit dataset options
+    parser.add_argument('--digit-data-dir', default=DEFAULT_DIGIT_DATA_DIR, help='Root path of digit dataset (contains subset_*/speaker dirs).')
+
+    # GRID dataset options
+    parser.add_argument('--grid-processed-root', default=DEFAULT_GRID_PROCESSED_ROOT,
+                        help='GRID processed root containing s*_processed speaker dirs with align/audio/video.')
+    parser.add_argument('--grid-original-root', default=DEFAULT_GRID_ORIGINAL_ROOT,
+                        help='GRID original root containing s*_processed speaker dirs with uncropped .mpg videos.')
+    parser.add_argument('--grid-speakers', default='',
+                        help='Comma-separated speaker IDs (e.g., s10,s11). Empty means all available speakers.')
+
+    return parser.parse_args()
 
 
 # --- Feature extraction functions ---
@@ -126,156 +149,115 @@ def compute_features(all_lm):
 
     return np.column_stack([vert_ap, outer_vert_ap, horiz_sp, inner_areas, outer_areas, compactness, lip_speed])
 
-def parse_annotation(lab_path, fps):
+def _is_number(s):
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def parse_annotation(lab_path, fps, num_frames=None):
     with open(lab_path) as f:
-        lines = f.read().strip().split('\n')
-    digits = lines[0].strip().split()
-    time_ranges = lines[1].strip().split()
+        lines = [ln.strip() for ln in f if ln.strip()]
+
+    if not lines:
+        return [], []
+
+    first_parts = lines[0].split()
+
+    # GRID/HTK style alignments: "<start> <end> <token>"
+    if len(first_parts) >= 3 and _is_number(first_parts[0]) and _is_number(first_parts[1]):
+        raw_entries = []
+        max_end = 0.0
+        for ln in lines:
+            parts = ln.split()
+            if len(parts) < 3 or not _is_number(parts[0]) or not _is_number(parts[1]):
+                continue
+            st = float(parts[0])
+            en = float(parts[1])
+            token = parts[2]
+            raw_entries.append((st, en, token))
+            max_end = max(max_end, en)
+
+        if num_frames is not None and fps is not None and max_end > 0:
+            duration_s = num_frames / fps
+            sec_per_unit = duration_s / max_end
+        else:
+            # GRID default time unit: 1/25000 second.
+            sec_per_unit = 1.0 / 25000.0
+
+        alignments = []
+        for st, en, token in raw_entries:
+            if token.lower() in {'sil', 'sp'}:
+                continue
+            sf = int(round(st * sec_per_unit * fps))
+            ef = int(round(en * sec_per_unit * fps))
+            alignments.append((sf, ef, token))
+
+        tokens = [tok for _, _, tok in alignments]
+        return tokens, alignments
+
+    # Digit dataset style:
+    # line 1: tokens
+    # line 2: per-token time ranges "ss-es"
+    if len(lines) < 2:
+        return [], []
+
+    tokens = lines[0].split()
+    time_ranges = lines[1].split()
     alignments = []
-    for digit, tr in zip(digits, time_ranges):
-        ss, es = tr.split('-')
+    for tok, tr in zip(tokens, time_ranges):
+        if '-' not in tr:
+            continue
+        ss, es = tr.split('-', 1)
         sf = int(float(ss) * fps)
         ef = int(float(es) * fps)
-        alignments.append((sf, ef, digit))
-    return digits, alignments
+        alignments.append((sf, ef, tok))
+    return tokens, alignments
 
 
-# --- Main preprocessing ---
-print("Initializing face landmarker...")
-base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
-options = vision.FaceLandmarkerOptions(
-    base_options=base_options,
-    output_face_blendshapes=False,
-    output_facial_transformation_matrixes=False,
-    num_faces=1
-)
-detector = vision.FaceLandmarker.create_from_options(options)
+def collect_digit_speaker_dirs(data_dir):
+    subsets = sorted([d for d in os.listdir(data_dir)
+                      if os.path.isdir(os.path.join(data_dir, d)) and d.startswith('subset_')])
+    print(f"Found subsets: {subsets}")
 
-# Discover all speakers across subsets and collect (speaker, subset, speaker_dir) entries
-subsets = sorted([d for d in os.listdir(DATA_DIR)
-                  if os.path.isdir(os.path.join(DATA_DIR, d)) and d.startswith('subset_')])
-print(f"Found subsets: {subsets}")
+    # unique_speaker_id (subset/speaker) -> list[(subset, speaker_dir)]
+    speaker_dirs_map = defaultdict(list)
+    for subset in subsets:
+        subset_path = os.path.join(data_dir, subset)
+        for spk in sorted(os.listdir(subset_path)):
+            spk_path = os.path.join(subset_path, spk)
+            if os.path.isdir(spk_path):
+                unique_speaker_id = f"{subset}/{spk}"
+                speaker_dirs_map[unique_speaker_id].append((subset, spk_path))
+    return speaker_dirs_map
 
-# Build a mapping: unique_speaker_id (subset/speaker) -> list of (subset, speaker_dir)
-speaker_dirs_map = defaultdict(list)
-for subset in subsets:
-    subset_path = os.path.join(DATA_DIR, subset)
-    for spk in sorted(os.listdir(subset_path)):
-        spk_path = os.path.join(subset_path, spk)
-        if os.path.isdir(spk_path):
-            unique_speaker_id = f"{subset}/{spk}"  # Unique ID: subset/speaker_number
-            speaker_dirs_map[unique_speaker_id].append((subset, spk_path))
 
-speakers = sorted(speaker_dirs_map.keys())
-print(f"Found {len(speakers)} unique speakers across {len(subsets)} subsets")
+def collect_grid_speaker_dirs(processed_root, original_root, selected_speakers=None):
+    speaker_dirs_map = defaultdict(list)
+    speaker_dirs = sorted(glob.glob(os.path.join(processed_root, 's*_processed')))
 
-# Split speakers into train/test
-rng = np.random.RandomState(RANDOM_SEED)
-rng.shuffle(speakers)
-n_test = max(1, int(len(speakers) * TEST_SPEAKER_RATIO))
-test_speakers = set(speakers[:n_test])
-train_speakers = set(speakers[n_test:])
-print(f"Train speakers: {len(train_speakers)}, Test speakers: {len(test_speakers)}")
-print(f"Test speakers: {sorted(test_speakers)}")
-
-# Storage: per-digit segments with metadata
-all_samples = []  # full video level
-failed_videos = []
-total_videos = 0
-
-for speaker in sorted(train_speakers | test_speakers):
-    for subset, speaker_dir in speaker_dirs_map[speaker]:
-        lab_dir = os.path.join(speaker_dir, 'lab')
-        video_dir = os.path.join(speaker_dir, 'video')
-        if not os.path.isdir(lab_dir) or not os.path.isdir(video_dir):
+    for proc_spk_dir in speaker_dirs:
+        if not os.path.isdir(proc_spk_dir):
             continue
-        lab_files = sorted(glob.glob(os.path.join(lab_dir, '*.lab')))
+        spk_folder = os.path.basename(proc_spk_dir)  # s10_processed
+        spk_id = spk_folder.replace('_processed', '')
+        if selected_speakers and spk_id not in selected_speakers:
+            continue
 
-        for lab_path in lab_files:
-            base_name = os.path.splitext(os.path.basename(lab_path))[0]
-            video_path = os.path.join(video_dir, base_name + '.mp4')
-            video_id = f"{subset}/{speaker}/{base_name}"
+        align_dir = os.path.join(proc_spk_dir, 'align')
+        audio_dir = os.path.join(proc_spk_dir, 'audio')
+        if not os.path.isdir(align_dir) or not os.path.isdir(audio_dir):
+            continue
 
-            if not os.path.exists(video_path):
-                failed_videos.append((video_id, "video not found"))
-                continue
+        orig_spk_dir = os.path.join(original_root, spk_folder)
+        if not os.path.isdir(orig_spk_dir):
+            continue
 
-            total_videos += 1
-            if total_videos % 50 == 0:
-                print(f"  Processing video {total_videos}...")
+        speaker_dirs_map[spk_id].append((proc_spk_dir, orig_spk_dir))
 
-            try:
-                all_lm, fps = extract_landmarks(video_path, detector)
-                if all_lm is None or len(all_lm) < 5:
-                    failed_videos.append((video_id, "landmark extraction failed"))
-                    continue
-
-                visual_features = compute_features(all_lm)
-                audio_path = os.path.join(speaker_dir, 'audio', base_name + '.wav')
-                if os.path.exists(audio_path):
-                    rms = extract_rms(audio_path, len(all_lm), fps)
-                else:
-                    rms = np.zeros(len(all_lm), dtype=np.float32)
-                features = np.column_stack([visual_features, rms])
-                digit_seq, alignments = parse_annotation(lab_path, fps)
-
-                # Extract per-digit segments
-                digit_segments = []
-                valid = True
-                for sf, ef, digit in alignments:
-                    sf_c = min(sf, features.shape[0])
-                    ef_c = min(ef, features.shape[0])
-                    if ef_c - sf_c < 2:
-                        valid = False
-                        break
-                    digit_segments.append(features[sf_c:ef_c])
-
-                if not valid:
-                    failed_videos.append((video_id, "segment too short"))
-                    continue
-
-                split = 'test' if speaker in test_speakers else 'train'
-                all_samples.append({
-                    'video_id': video_id,
-                    'speaker': speaker,
-                    'split': split,
-                    'digit_sequence': digit_seq,
-                    'full_features': features,          # (T_video, 7)
-                    'digit_segments': digit_segments,   # list of (T_digit, 7)
-                    'alignments': alignments,
-                    'fps': fps,
-                })
-
-            except Exception as e:
-                failed_videos.append((video_id, str(e)))
-                continue
-
-print(f"\nProcessed {total_videos} videos total")
-print(f"Successful: {len(all_samples)}, Failed: {len(failed_videos)}")
-if failed_videos:
-    print(f"First 10 failures:")
-    for vid, reason in failed_videos[:10]:
-        print(f"  {vid}: {reason}")
-
-# --- Save processed data ---
-train_samples = [s for s in all_samples if s['split'] == 'train']
-test_samples = [s for s in all_samples if s['split'] == 'test']
-
-print(f"\nTrain samples: {len(train_samples)}")
-print(f"Test samples: {len(test_samples)}")
-
-# Count digit distribution
-train_digit_count = defaultdict(int)
-test_digit_count = defaultdict(int)
-for s in train_samples:
-    for d in s['digit_sequence']:
-        train_digit_count[d] += 1
-for s in test_samples:
-    for d in s['digit_sequence']:
-        test_digit_count[d] += 1
-
-print(f"\nTrain digit distribution: {dict(sorted(train_digit_count.items()))}")
-print(f"Test digit distribution:  {dict(sorted(test_digit_count.items()))}")
+    return speaker_dirs_map
 
 
 def save_split(samples, filepath):
@@ -315,24 +297,194 @@ def save_split(samples, filepath):
     print(f"Saved {len(samples)} samples to {filepath}")
 
 
-save_split(train_samples, os.path.join(OUTPUT_DIR, 'train.npz'))
-save_split(test_samples, os.path.join(OUTPUT_DIR, 'test.npz'))
+def main():
+    # --- Main preprocessing ---
+    args = parse_args()
+    output_dir = os.path.join(args.output_dir, args.dataset)
+    os.makedirs(output_dir, exist_ok=True)
 
-# Save metadata
-metadata = {
-    'n_features': len(FEATURE_NAMES),
-    'feature_names': FEATURE_NAMES,
-    'n_train': len(train_samples),
-    'n_test': len(test_samples),
-    'train_speakers': sorted(train_speakers),
-    'test_speakers': sorted(test_speakers),
-    'train_digit_dist': dict(sorted(train_digit_count.items())),
-    'test_digit_dist': dict(sorted(test_digit_count.items())),
-    'n_failed': len(failed_videos),
-    'digits_per_video': 8,
-}
-with open(os.path.join(OUTPUT_DIR, 'metadata.json'), 'w') as f:
-    json.dump(metadata, f, indent=2)
-print(f"Saved metadata to {os.path.join(OUTPUT_DIR, 'metadata.json')}")
+    print("Initializing face landmarker...")
+    base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
+        num_faces=1
+    )
+    detector = vision.FaceLandmarker.create_from_options(options)
 
-print("\nPreprocessing complete!")
+    if args.dataset == 'digit':
+        speaker_dirs_map = collect_digit_speaker_dirs(args.digit_data_dir)
+        print(f"Found {len(speaker_dirs_map)} unique speakers in digit dataset")
+    else:
+        selected_speakers = None
+        if args.grid_speakers.strip():
+            selected_speakers = {s.strip() for s in args.grid_speakers.split(',') if s.strip()}
+        speaker_dirs_map = collect_grid_speaker_dirs(
+            args.grid_processed_root,
+            args.grid_original_root,
+            selected_speakers=selected_speakers
+        )
+        print(f"Found {len(speaker_dirs_map)} GRID speakers")
+
+    speakers = sorted(speaker_dirs_map.keys())
+    if not speakers:
+        raise RuntimeError("No speakers found. Check dataset paths and options.")
+
+    # Split speakers into train/test
+    rng = np.random.RandomState(args.seed)
+    rng.shuffle(speakers)
+    n_test = int(len(speakers) * args.test_speaker_ratio)
+    if len(speakers) > 1 and args.test_speaker_ratio > 0 and n_test == 0:
+        n_test = 1
+
+    test_speakers = set(speakers[:n_test])
+    train_speakers = set(speakers[n_test:])
+    print(f"Train speakers: {len(train_speakers)}, Test speakers: {len(test_speakers)}")
+    print(f"Test speakers: {sorted(test_speakers)}")
+
+    # Storage: per-utterance segments with metadata
+    all_samples = []
+    failed_videos = []
+    total_videos = 0
+
+    for speaker in sorted(train_speakers | test_speakers):
+        source_entries = speaker_dirs_map[speaker]
+
+        for source_a, source_b in source_entries:
+            if args.dataset == 'digit':
+                subset, speaker_dir = source_a, source_b
+                lab_dir = os.path.join(speaker_dir, 'lab')
+                video_dir = os.path.join(speaker_dir, 'video')
+                audio_dir = os.path.join(speaker_dir, 'audio')
+                lab_ext = '.lab'
+                video_ext = '.mp4'
+                video_prefix = f"{subset}/{speaker}"
+            else:
+                processed_speaker_dir, original_speaker_dir = source_a, source_b
+                lab_dir = os.path.join(processed_speaker_dir, 'align')
+                audio_dir = os.path.join(processed_speaker_dir, 'audio')
+                video_dir = original_speaker_dir
+                lab_ext = '.align'
+                video_ext = '.mpg'
+                video_prefix = f"grid/{speaker}"
+
+            if not os.path.isdir(lab_dir) or not os.path.isdir(video_dir):
+                continue
+
+            lab_files = sorted(glob.glob(os.path.join(lab_dir, '*' + lab_ext)))
+
+            for lab_path in lab_files:
+                base_name = os.path.splitext(os.path.basename(lab_path))[0]
+                video_path = os.path.join(video_dir, base_name + video_ext)
+                audio_path = os.path.join(audio_dir, base_name + '.wav')
+                video_id = f"{video_prefix}/{base_name}"
+
+                if not os.path.exists(video_path):
+                    failed_videos.append((video_id, "video not found"))
+                    continue
+
+                total_videos += 1
+                if total_videos % 50 == 0:
+                    print(f"  Processing video {total_videos}...")
+
+                try:
+                    all_lm, fps = extract_landmarks(video_path, detector)
+                    if all_lm is None or len(all_lm) < 5:
+                        failed_videos.append((video_id, "landmark extraction failed"))
+                        continue
+
+                    visual_features = compute_features(all_lm)
+                    if os.path.exists(audio_path):
+                        rms = extract_rms(audio_path, len(all_lm), fps)
+                    else:
+                        rms = np.zeros(len(all_lm), dtype=np.float32)
+                    features = np.column_stack([visual_features, rms])
+                    token_seq, alignments = parse_annotation(lab_path, fps, num_frames=len(all_lm))
+                    if not alignments:
+                        failed_videos.append((video_id, "empty alignment"))
+                        continue
+
+                    # Extract per-token segments
+                    token_segments = []
+                    valid = True
+                    for sf, ef, _ in alignments:
+                        sf_c = min(sf, features.shape[0])
+                        ef_c = min(ef, features.shape[0])
+                        if ef_c - sf_c < 2:
+                            valid = False
+                            break
+                        token_segments.append(features[sf_c:ef_c])
+
+                    if not valid:
+                        failed_videos.append((video_id, "segment too short"))
+                        continue
+
+                    split = 'test' if speaker in test_speakers else 'train'
+                    all_samples.append({
+                        'video_id': video_id,
+                        'speaker': speaker,
+                        'split': split,
+                        'digit_sequence': token_seq,
+                        'full_features': features,
+                        'digit_segments': token_segments,
+                        'alignments': alignments,
+                        'fps': fps,
+                    })
+
+                except Exception as e:
+                    failed_videos.append((video_id, str(e)))
+                    continue
+
+    print(f"\nProcessed {total_videos} videos total")
+    print(f"Successful: {len(all_samples)}, Failed: {len(failed_videos)}")
+    if failed_videos:
+        print(f"First 10 failures:")
+        for vid, reason in failed_videos[:10]:
+            print(f"  {vid}: {reason}")
+
+    # --- Save processed data ---
+    train_samples = [s for s in all_samples if s['split'] == 'train']
+    test_samples = [s for s in all_samples if s['split'] == 'test']
+
+    print(f"\nTrain samples: {len(train_samples)}")
+    print(f"Test samples: {len(test_samples)}")
+
+    # Count token distribution
+    train_digit_count = defaultdict(int)
+    test_digit_count = defaultdict(int)
+    for s in train_samples:
+        for d in s['digit_sequence']:
+            train_digit_count[d] += 1
+    for s in test_samples:
+        for d in s['digit_sequence']:
+            test_digit_count[d] += 1
+
+    print(f"\nTrain digit distribution: {dict(sorted(train_digit_count.items()))}")
+    print(f"Test digit distribution:  {dict(sorted(test_digit_count.items()))}")
+
+    save_split(train_samples, os.path.join(output_dir, 'train.npz'))
+    save_split(test_samples, os.path.join(output_dir, 'test.npz'))
+
+    metadata = {
+        'dataset': args.dataset,
+        'n_features': len(FEATURE_NAMES),
+        'feature_names': FEATURE_NAMES,
+        'n_train': len(train_samples),
+        'n_test': len(test_samples),
+        'train_speakers': sorted(train_speakers),
+        'test_speakers': sorted(test_speakers),
+        'train_digit_dist': dict(sorted(train_digit_count.items())),
+        'test_digit_dist': dict(sorted(test_digit_count.items())),
+        'n_failed': len(failed_videos),
+        'digits_per_video': 8 if args.dataset == 'digit' else None,
+    }
+    with open(os.path.join(output_dir, 'metadata.json'), 'w') as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Saved metadata to {os.path.join(output_dir, 'metadata.json')}")
+
+    print("\nPreprocessing complete!")
+
+
+if __name__ == '__main__':
+    main()
