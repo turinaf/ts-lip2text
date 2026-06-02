@@ -1,152 +1,199 @@
 # ts-lip2text
 
-Lip-text verification using time series analysis. Given a lip movement video and a claimed digit sequence, the system extracts temporal lip features and verifies whether the lip movements match the claimed text.
+Lip-based digit verification and transcription from time-series facial landmarks.
+The project supports:
 
-## Pipeline
+- sequence-level verification (`--mode sequence`)
+- per-digit verification (`--mode digit`)
+- seq2seq transcription (`--mode seq2seq`)
 
+## Current Pipeline
+
+```text
+Video (.mp4) + Lab Annotation (.lab) + Audio (.wav, optional)
+        |
+        v
+preprocess.py
+  - extract MediaPipe landmarks
+  - compute 8D frame-level features
+  - segment by .lab alignments
+  - split by speaker (no speaker overlap)
+        |
+        v
+processed_data/
+  - train.npz
+  - test.npz
+  - metadata.json
+        |
+        v
+train.py
+  - digit / sequence / seq2seq training
+        |
+        v
+models/
+  - best_digit_verifier.pt
+  - best_sequence_verifier.pt
+  - best_seq2seq.pt
+  - results_digit.json
+  - results_sequence.json
+  - results_seq2seq.json
+        |
+        v
+test.py / inference.py
 ```
-Video (.mp4) + Annotation (.lab)
-        │
-        ▼
-  preprocess.py          Extract 5D lip features, segment per digit, speaker-level split
-        │
-        ▼
-  processed_data/        train.npz, test.npz, metadata.json
-        │
-        ▼
-  train.py               Train verification model (CNN + BiGRU)
-        │
-        ▼
-  models/                best_{mode}_verifier.pt, results_{mode}.json
-        │
-        ▼
-  test.py / inference.py Evaluate on test set / run on new videos
+
+## Features (Current)
+
+The model now uses **8 features per frame**:
+
+1. inner vertical aperture
+2. outer vertical aperture
+3. horizontal spread
+4. inner lip area
+5. outer lip area
+6. compactness
+7. lip speed
+8. RMS audio energy
+
+Spatial terms are normalized by inter-ocular distance. Detailed formulas are in [FEATURES.md](FEATURES.md).
+
+## Dataset Assumptions
+
+- Vocabulary: `0-9` and `!` (`!` is alternate pronunciation for digit 1)
+- Each utterance is expected to contain **8 digits**
+- `.lab` format:
+  - line 1: token sequence (`3 5 3 9 6 7 8 7`)
+  - line 2: per-digit time spans (`0.54-0.83 0.84-1.03 ...`)
+
+Expected raw data layout:
+
+```text
+data/
+  face_landmarker.task
+  lipdata-digit/
+    subset_01/
+      <speaker_id>/
+        video/*.mp4
+        lab/*.lab
+        audio/*.wav
+    subset_02/
+    ...
 ```
 
-## Features
+## Installation
 
-5D multivariate time series extracted per frame using MediaPipe Face Mesh (478 landmarks):
+Python 3.10+ is recommended.
 
-| # | Feature | What it captures |
-|---|---------|-----------------|
-| 1 | Vertical Aperture | Mouth opening height (inner lip) |
-| 2 | Horizontal Spread | Lip width |
-| 3 | Inner Lip Area | Oral opening area |
-| 4 | Compactness | Round vs elongated lip shape |
-| 5 | Lip Speed | Overall movement velocity |
-
-All spatial features are normalized by inter-ocular distance for head-size invariance. See [FEATURES.md](FEATURES.md) for detailed formulas.
-
-## Data Format
-
-Each video contains a person reading **8 Chinese digits** (vocabulary: 0-9 and `!` for alternate pronunciation of 1). The `.lab` annotation provides:
-- Line 1: space-separated digit sequence (e.g., `3 5 3 9 6 7 8 7`)
-- Line 2: space-separated time ranges in seconds (e.g., `0.54-0.83 0.84-1.03 ...`)
-
-## Model Architecture
-
-Two verification modes, plus one transcription mode:
-
-- **Sequence-level** (`--mode sequence`, recommended): Encodes all 8 digit segments with a shared encoder, compares each against its claimed digit embedding, aggregates into a single match/mismatch decision.
-- **Digit-level** (`--mode digit`): Verifies each lip segment against a single claimed digit independently.
-- **Seq2seq transcription** (`--mode seq2seq`): Tiny Transformer encoder-decoder that predicts the digit string directly from the segment sequence.
-
-Architecture: `Conv1D x2 → BatchNorm → ReLU → Bidirectional GRU → Masked Mean Pooling → FC`. See [PIPELINE.md](PIPELINE.md) for full details.
+```bash
+pip install numpy torch torchvision torchaudio opencv-python mediapipe librosa scipy scikit-learn tqdm tensorboard
+```
 
 ## Usage
 
-### 1. Preprocess
+### 1) Preprocess
 
 ```bash
 python preprocess.py
 ```
 
-Extracts features from all videos, segments per digit, and splits into train/test by speaker (~80/20, no speaker overlap).
+This generates:
 
-### 2. Train
+- `processed_data/train.npz`
+- `processed_data/test.npz`
+- `processed_data/metadata.json`
+
+Notes:
+
+- speaker-disjoint split (`TEST_SPEAKER_RATIO = 0.1`)
+- failed samples are reported in preprocessing logs
+
+### 2) Train
 
 ```bash
-# Sequence-level verifier (recommended)
+# Sequence-level verification (default)
 python train.py --mode sequence --epochs 50
 
-# Digit-level verifier
+# Digit-level verification
 python train.py --mode digit --epochs 50
 
-# Seq2seq transcription model
+# Seq2seq transcription
 python train.py --mode seq2seq --epochs 50
 
 # Custom hyperparameters
-python train.py --mode sequence --epochs 100 --lr 5e-4 --batch_size 32
+python train.py --mode sequence --epochs 100 --lr 3e-4 --batch_size 32
 ```
 
-Training logs are saved to `runs/` for TensorBoard:
+Training outputs:
+
+- checkpoints in `models/`
+- metrics json in `models/results_<mode>.json`
+- TensorBoard logs in `runs/`
 
 ```bash
 tensorboard --logdir runs/
 ```
 
-### 3. Test
+### 3) Evaluate
 
-Evaluate the trained model on the held-out test set:
+`test.py` currently supports verification modes (`digit`, `sequence`):
 
 ```bash
-# Sequence-level
 python test.py --mode sequence
-
-# Digit-level (includes per-digit precision/recall/F1 breakdown)
 python test.py --mode digit
-
-# Save detailed results to JSON
 python test.py --mode sequence --save
 ```
 
-### 4. Inference
+`--save` writes `models/test_results_<mode>.json`.
 
-Run verification on a new video:
+For `seq2seq`, validation is run inside `train.py` (`token_acc`, `exact_match_acc`), and you can also inspect predictions using `inference.py`.
+
+### 4) Inference
 
 ```bash
-# With .lab annotation (precise timing-based segmentation)
-python inference.py --video path/to/video.mp4 --lab path/to/annotation.lab
+# Sequence verification using exact .lab boundaries
+python inference.py --video path/to/video.mp4 --lab path/to/file.lab --mode sequence
 
-# With raw digit string (evenly splits video across digits)
-python inference.py --video path/to/video.mp4 --digits "1 3 5 7 9 2 4 6"
+# Sequence verification with claimed digits and auto-segmentation
+python inference.py --video path/to/video.mp4 --digits "1 3 5 7 9 2 4 6" --mode sequence
 
-# Per-digit mode
+# Per-digit verification
 python inference.py --video path/to/video.mp4 --lab path/to/file.lab --mode digit
 
-# Seq2seq transcription
-python inference.py --video path/to/video.mp4 --mode seq2seq --lab path/to/file.lab
+# Seq2seq transcription from .lab segmentation
+python inference.py --video path/to/video.mp4 --lab path/to/file.lab --mode seq2seq
 
-# Seq2seq transcription with auto-segmentation length
+# Seq2seq transcription with auto segmentation length
 python inference.py --video path/to/video.mp4 --mode seq2seq --n_digits 8
 ```
 
-## File Structure
+Important CLI constraints:
 
-```
-├── preprocess.py              # Full dataset preprocessing
-├── train.py                   # Model training with TensorBoard logging
-├── test.py                    # Model evaluation on test set
-├── inference.py               # Single-video inference
-├── model.py                   # Model definitions (LipEncoder, DigitVerifier, SequenceVerifier)
-├── digit_visual_signal.py     # Single-sample feature visualization
-├── compare_samples.py         # Multi-speaker feature comparison
-├── FEATURES.md                # Feature documentation
-├── PIPELINE.md                # Pipeline documentation
-├── data/
-│   ├── face_landmarker.task   # MediaPipe face landmark model
-│   └── lipdata0405-filter/    # Raw dataset (videos + annotations)
-├── processed_data/            # Preprocessed .npz files (generated)
-├── models/                    # Trained model checkpoints (generated)
-└── runs/                      # TensorBoard logs (generated)
+- verification modes (`digit`, `sequence`): provide exactly one of `--lab` or `--digits`
+- seq2seq mode: provide `--lab`, or provide `--n_digits` for auto-segmentation
+
+## Core Files
+
+```text
+preprocess.py   # data preprocessing and split
+dataset.py      # datasets for digit/sequence/seq2seq modes
+model.py        # LipEncoder, DigitVerifier, SequenceVerifier, TinyLipSeq2Seq
+train.py        # training entry point for all modes
+test.py         # evaluation for verification modes
+inference.py    # single-video inference / transcription
+FEATURES.md     # feature definitions
+PIPELINE.md     # architecture and pipeline notes
 ```
 
-## Requirements
+## Device Support
 
-- Python 3.10+
-- PyTorch
-- MediaPipe
-- OpenCV
-- scikit-learn
-- tqdm
-- tensorboard
+The code auto-selects device in this order:
+
+1. CUDA
+2. Apple MPS
+3. CPU
+
+## Troubleshooting
+
+- If preprocessing or inference fails immediately, verify `data/face_landmarker.task` exists.
+- If `processed_data/train.npz` or `processed_data/test.npz` is missing, run `python preprocess.py` first.
+- If a checkpoint is missing, run the corresponding `train.py --mode ...` command first.
