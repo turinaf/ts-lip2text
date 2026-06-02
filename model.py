@@ -5,6 +5,8 @@ LipEncoder: 1D-CNN + BiGRU encoder for lip segment time series
 DigitVerifier: per-digit verification (lip segment vs single digit)
 SequenceVerifier: full 8-digit sequence verification
 """
+import math
+
 import torch
 import torch.nn as nn
 
@@ -20,15 +22,19 @@ class LipEncoder(nn.Module):
     def __init__(self, n_features=5, hidden_dim=128, embed_dim=64):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv1d(n_features, 32, kernel_size=3, padding=1),
+            nn.Conv1d(n_features, 32, kernel_size=3, padding=1),          # dilation=1
             nn.BatchNorm1d(32),
             nn.ReLU(),
-            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.Conv1d(32, 64, kernel_size=3, padding=2, dilation=2),      # dilation=2
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Conv1d(64, 64, kernel_size=3, padding=4, dilation=4),      # dilation=4
             nn.BatchNorm1d(64),
             nn.ReLU(),
         )
         self.gru = nn.GRU(64, hidden_dim, batch_first=True, bidirectional=True)
         self.fc = nn.Linear(hidden_dim * 2, embed_dim)
+        self.attn = nn.Linear(hidden_dim * 2, 1)  # add to __init__
 
     def forward(self, x, mask):
         """
@@ -41,7 +47,10 @@ class LipEncoder(nn.Module):
 
         # Masked mean pooling
         mask_exp = mask.unsqueeze(-1)         # (B, T, 1)
-        h = (h * mask_exp).sum(dim=1) / (mask_exp.sum(dim=1) + 1e-8)
+        attn_w = self.attn(h).squeeze(-1)          # (B, T)
+        attn_w = attn_w.masked_fill(~mask.bool(), float('-inf'))
+        attn_w = torch.softmax(attn_w, dim=1).unsqueeze(-1)
+        h = (h * attn_w).sum(dim=1)               # (B, hidden*2)
         return self.fc(h)                     # (B, embed_dim)
 
 
@@ -52,7 +61,7 @@ class DigitVerifier(nn.Module):
         self.lip_encoder = LipEncoder(n_features, hidden_dim, embed_dim)
         self.digit_embedding = nn.Embedding(n_classes, embed_dim)
         self.classifier = nn.Sequential(
-            nn.Linear(embed_dim * 2, 64),
+            nn.Linear(embed_dim * 4, 64),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(64, 1),
@@ -67,7 +76,9 @@ class DigitVerifier(nn.Module):
         """
         lip_emb = self.lip_encoder(lip_features, mask)
         digit_emb = self.digit_embedding(claimed_digit.squeeze(1))
-        combined = torch.cat([lip_emb, digit_emb], dim=1)
+        diff = lip_emb - digit_emb
+        prod = lip_emb * digit_emb
+        combined = torch.cat([lip_emb, digit_emb, diff, prod], dim=1)
         return self.classifier(combined)
 
 
@@ -87,11 +98,8 @@ class SequenceVerifier(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(64, 1),
         )
-        self.seq_agg = nn.Sequential(
-            nn.Linear(1, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-        )
+        self.seq_agg = nn.GRU(1, 32, batch_first=True)
+        self.seq_out = nn.Linear(32, 1)
 
     def forward(self, segments, masks, claimed_digits, seq_mask=None):
         """
@@ -116,4 +124,110 @@ class SequenceVerifier(nn.Module):
         else:
             pooled = per_digit_scores.mean(dim=1, keepdim=True)
 
-        return self.seq_agg(pooled)
+        scores_input = per_digit_scores.unsqueeze(-1)  # (B, S, 1)
+        _, h = self.seq_agg(scores_input)                 # h: (1, B, 32)
+        return self.seq_out(h.squeeze(0))
+
+
+class TinyLipSeq2Seq(nn.Module):
+    """Small Transformer encoder-decoder for lip sequence transcription."""
+
+    def __init__(
+        self,
+        vocab_size,
+        pad_idx,
+        n_features=8,
+        seg_embed_dim=48,
+        n_heads=4,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        ff_dim=128,
+        dropout=0.1,
+        max_src_len=12,
+        max_tgt_len=12,
+        hidden_dim=64,
+    ):
+        super().__init__()
+        self.pad_idx = pad_idx
+        self.seg_encoder = LipEncoder(
+            n_features=n_features,
+            hidden_dim=hidden_dim,
+            embed_dim=seg_embed_dim,
+        )
+        self.src_pos_emb = nn.Embedding(max_src_len, seg_embed_dim)
+        self.tgt_tok_emb = nn.Embedding(vocab_size, seg_embed_dim)
+        self.tgt_pos_emb = nn.Embedding(max_tgt_len, seg_embed_dim)
+
+        self.transformer = nn.Transformer(
+            d_model=seg_embed_dim,
+            nhead=n_heads,
+            num_encoder_layers=n_encoder_layers,
+            num_decoder_layers=n_decoder_layers,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            batch_first=True,
+        )
+        # MPS currently lacks the nested-tensor op used by the encoder fast path.
+        # Keep masking behavior but force the regular code path on Apple Silicon.
+        if torch.backends.mps.is_available():
+            self.transformer.encoder.enable_nested_tensor = False
+            self.transformer.encoder.use_nested_tensor = False
+        self.out = nn.Linear(seg_embed_dim, vocab_size)
+
+    @staticmethod
+    def _causal_mask(length, device):
+        mask = torch.full((length, length), float('-inf'), device=device)
+        return torch.triu(mask, diagonal=1)
+
+    def encode(self, segments, masks, src_key_padding_mask):
+        """
+        segments: (B, S, T, F)
+        masks: (B, S, T)
+        src_key_padding_mask: (B, S), True means padded position
+        """
+        bsz, src_len, t_len, n_feat = segments.shape
+        seg_flat = segments.view(bsz * src_len, t_len, n_feat)
+        mask_flat = masks.view(bsz * src_len, t_len)
+        src = self.seg_encoder(seg_flat, mask_flat).view(bsz, src_len, -1)
+
+        src_pos = torch.arange(src_len, device=segments.device).unsqueeze(0)
+        src = src + self.src_pos_emb(src_pos)
+        return self.transformer.encoder(src, src_key_padding_mask=src_key_padding_mask)
+
+    def decode(self, memory, src_key_padding_mask, tgt_in):
+        """
+        memory: (B, S, D)
+        tgt_in: (B, L)
+        """
+        tgt_len = tgt_in.shape[1]
+        tgt_pos = torch.arange(tgt_len, device=tgt_in.device).unsqueeze(0)
+        tgt = self.tgt_tok_emb(tgt_in) * math.sqrt(self.tgt_tok_emb.embedding_dim)
+        tgt = tgt + self.tgt_pos_emb(tgt_pos)
+
+        tgt_mask = self._causal_mask(tgt_len, tgt_in.device)
+        tgt_key_padding_mask = tgt_in.eq(self.pad_idx)
+
+        dec = self.transformer.decoder(
+            tgt,
+            memory,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=src_key_padding_mask,
+        )
+        return self.out(dec)
+
+    def forward(self, segments, masks, src_key_padding_mask, tgt_in):
+        memory = self.encode(segments, masks, src_key_padding_mask)
+        return self.decode(memory, src_key_padding_mask, tgt_in)
+
+    def greedy_decode(self, segments, masks, src_key_padding_mask, bos_idx, max_len):
+        memory = self.encode(segments, masks, src_key_padding_mask)
+        bsz = segments.shape[0]
+        ys = torch.full((bsz, 1), bos_idx, dtype=torch.long, device=segments.device)
+
+        for _ in range(max_len):
+            logits = self.decode(memory, src_key_padding_mask, ys)
+            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            ys = torch.cat([ys, next_token], dim=1)
+
+        return ys[:, 1:]

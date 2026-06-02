@@ -6,6 +6,7 @@ Preprocess the full lip-reading dataset:
 - Save as .npz for downstream training
 """
 import cv2
+import librosa
 import mediapipe as mp_lib
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -39,10 +40,21 @@ IDX_RIGHT_CORNER = 291
 LEFT_EYE_OUTER = 33
 RIGHT_EYE_OUTER = 263
 
-FEATURE_NAMES = ['vert_aperture', 'outer_vert_aperture', 'horiz_spread', 'inner_area', 'outer_area', 'compactness', 'lip_speed']
+FEATURE_NAMES = ['vert_aperture', 'outer_vert_aperture', 'horiz_spread', 'inner_area', 'outer_area', 'compactness', 'lip_speed', 'rms_energy']
 
 
 # --- Feature extraction functions ---
+def extract_rms(audio_path, num_frames, fps):
+    """Load audio and return per-video-frame RMS energy, shape (num_frames,)."""
+    y, sr = librosa.load(audio_path, sr=None, mono=True)
+    hop_length = max(1, int(sr / fps))
+    rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]  # (n_audio_frames,)
+    # Interpolate RMS timeline onto video frame timestamps
+    audio_times = np.arange(len(rms)) * hop_length / sr
+    video_times = np.arange(num_frames) / fps
+    return np.interp(video_times, audio_times, rms)  # (num_frames,)
+
+
 def polygon_area(points):
     x, y = points[:, 0], points[:, 1]
     return 0.5 * np.abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
@@ -198,7 +210,13 @@ for speaker in sorted(train_speakers | test_speakers):
                     failed_videos.append((video_id, "landmark extraction failed"))
                     continue
 
-                features = compute_features(all_lm)
+                visual_features = compute_features(all_lm)
+                audio_path = os.path.join(speaker_dir, 'audio', base_name + '.wav')
+                if os.path.exists(audio_path):
+                    rms = extract_rms(audio_path, len(all_lm), fps)
+                else:
+                    rms = np.zeros(len(all_lm), dtype=np.float32)
+                features = np.column_stack([visual_features, rms])
                 digit_seq, alignments = parse_annotation(lab_path, fps)
 
                 # Extract per-digit segments

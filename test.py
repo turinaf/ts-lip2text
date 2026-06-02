@@ -20,7 +20,7 @@ from model import (DigitVerifier, SequenceVerifier,
 PROCESSED_DIR = 'processed_data'
 MODEL_DIR = 'models'
 MAX_SEQ_LEN = 30
-N_FEATURES = 5
+N_FEATURES = 8
 EMBED_DIM = 64
 HIDDEN_DIM = 128
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else

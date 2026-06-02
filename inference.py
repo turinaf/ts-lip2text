@@ -8,8 +8,10 @@ Usage:
     python inference.py --video path/to/video.mp4 --digits "1 3 5 7 9 2 4 6"
     python inference.py --video path/to/video.mp4 --lab path/to/annotation.lab
     python inference.py --video path/to/video.mp4 --digits "1 3 5 7 9 2 4 6" --mode digit
+    python inference.py --video path/to/video.mp4 --mode seq2seq --lab path/to/annotation.lab
 """
 import cv2
+import librosa
 import mediapipe as mp_lib
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -19,17 +21,20 @@ import argparse
 import os
 
 from model import (DigitVerifier, SequenceVerifier,
-                   CHAR_TO_IDX, VOCAB, N_CLASSES)
+                   TinyLipSeq2Seq, CHAR_TO_IDX, VOCAB, N_CLASSES)
 
 # --- Configuration ---
 FACE_MODEL_PATH = 'data/face_landmarker.task'
 MODEL_DIR = 'models'
 MAX_SEQ_LEN = 30
-N_FEATURES = 5
 EMBED_DIM = 64
 HIDDEN_DIM = 128
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else
                        'mps' if torch.backends.mps.is_available() else 'cpu')
+PAD_IDX = N_CLASSES
+BOS_IDX = N_CLASSES + 1
+EOS_IDX = N_CLASSES + 2
+SEQ2SEQ_VOCAB_SIZE = N_CLASSES + 3
 
 # Lip landmark indices
 OUTER_LIP = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291,
@@ -90,8 +95,21 @@ def extract_landmarks(video_path, detector):
     return np.array(landmarks_list), fps
 
 
+def extract_rms_from_video(video_path, num_frames, fps):
+    """Extract per-video-frame RMS energy from the audio track of an mp4."""
+    try:
+        y, sr = librosa.load(video_path, sr=None, mono=True)
+        hop_length = max(1, int(sr / fps))
+        rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+        audio_times = np.arange(len(rms)) * hop_length / sr
+        video_times = np.arange(num_frames) / fps
+        return np.interp(video_times, audio_times, rms)
+    except Exception:
+        return np.zeros(num_frames, dtype=np.float32)
+
+
 def compute_features(all_lm):
-    """Compute 5D lip features from face landmarks: (T, 5)."""
+    """Compute lip features from face landmarks: (T, 7)."""
     num_frames = len(all_lm)
     interocular = np.linalg.norm(
         all_lm[:, LEFT_EYE_OUTER] - all_lm[:, RIGHT_EYE_OUTER], axis=1
@@ -101,11 +119,15 @@ def compute_features(all_lm):
     vert_ap = np.linalg.norm(
         all_lm[:, IDX_TOP_INNER] - all_lm[:, IDX_BOTTOM_INNER], axis=1
     ) / interocular
+    outer_vert_ap = np.linalg.norm(
+        all_lm[:, 17] - all_lm[:, 0], axis=1
+    ) / interocular
     horiz_sp = np.linalg.norm(
         all_lm[:, IDX_LEFT_CORNER] - all_lm[:, IDX_RIGHT_CORNER], axis=1
     ) / interocular
 
     inner_areas = np.zeros(num_frames)
+    outer_areas = np.zeros(num_frames)
     compactness = np.zeros(num_frames)
     for i in range(num_frames):
         lm = all_lm[i]
@@ -113,13 +135,22 @@ def compute_features(all_lm):
         oa = polygon_area(lm[OUTER_LIP])
         op = polygon_perimeter(lm[OUTER_LIP])
         inner_areas[i] = ia / (interocular[i] ** 2)
+        outer_areas[i] = oa / (interocular[i] ** 2)
         compactness[i] = (4 * np.pi * oa) / (op ** 2 + 1e-8)
 
     vv = np.gradient(vert_ap)
     hv = np.gradient(horiz_sp)
     lip_speed = np.sqrt(vv ** 2 + hv ** 2)
 
-    return np.column_stack([vert_ap, horiz_sp, inner_areas, compactness, lip_speed])
+    return np.column_stack([
+        vert_ap,
+        outer_vert_ap,
+        horiz_sp,
+        inner_areas,
+        outer_areas,
+        compactness,
+        lip_speed,
+    ])
 
 
 def parse_lab_file(lab_path, fps):
@@ -209,11 +240,38 @@ def pad_segment(seg, max_len):
         feat = seg[:max_len].astype(np.float32)
         mask = np.ones(max_len, dtype=np.float32)
     else:
-        feat = np.zeros((max_len, N_FEATURES), dtype=np.float32)
+        feat = np.zeros((max_len, seg.shape[1]), dtype=np.float32)
         feat[:T] = seg
         mask = np.zeros(max_len, dtype=np.float32)
         mask[:T] = 1.0
     return feat, mask
+
+
+def adapt_feature_dim(features, target_dim):
+    """Slice or zero-pad feature columns to match the model input width."""
+    current_dim = features.shape[1]
+    if current_dim == target_dim:
+        return features
+    if current_dim > target_dim:
+        return features[:, :target_dim]
+
+    padded = np.zeros((features.shape[0], target_dim), dtype=np.float32)
+    padded[:, :current_dim] = features
+    return padded
+
+
+def infer_input_feature_dim(state_dict):
+    for key in (
+        'seg_encoder.conv.0.weight',
+        'lip_encoder.conv.0.weight',
+    ):
+        if key in state_dict:
+            return state_dict[key].shape[1]
+    raise RuntimeError('Could not infer feature dimension from checkpoint')
+
+
+def infer_n_digits_from_segments(segments):
+    return len(segments)
 
 
 # --- Inference ---
@@ -255,25 +313,72 @@ def infer_per_digit(model, segments, digits, device):
     return results
 
 
+def infer_seq2seq(model, segments, device, max_len):
+    """Run seq2seq transcription and return predicted token ids."""
+    all_feats, all_masks = [], []
+    for seg in segments:
+        f, m = pad_segment(seg, MAX_SEQ_LEN)
+        all_feats.append(f)
+        all_masks.append(m)
+
+    feats_t = torch.FloatTensor(np.array([all_feats])).to(device)
+    masks_t = torch.FloatTensor(np.array([all_masks])).to(device)
+    src_pad = torch.zeros((1, len(segments)), dtype=torch.bool, device=device)
+
+    with torch.no_grad():
+        pred_tokens = model.greedy_decode(
+            feats_t,
+            masks_t,
+            src_pad,
+            bos_idx=BOS_IDX,
+            max_len=max_len,
+        )[0].cpu().tolist()
+
+    out = []
+    for tok in pred_tokens:
+        if tok == EOS_IDX or tok == PAD_IDX:
+            break
+        out.append(tok)
+    return out
+
+
 # --- Main ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Lip-text verification inference')
     parser.add_argument('--video', type=str, required=True,
                         help='Path to input video file')
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--digits', type=str,
-                       help='Claimed digit string, space-separated (e.g. "1 3 5 7 9 2 4 6")')
-    group.add_argument('--lab', type=str,
-                       help='Path to .lab annotation file (contains digits + time ranges)')
-    parser.add_argument('--mode', choices=['digit', 'sequence'], default='sequence',
+    parser.add_argument('--digits', type=str,
+                        help='Claimed digit string, space-separated (e.g. "1 3 5 7 9 2 4 6")')
+    parser.add_argument('--lab', type=str,
+                        help='Path to .lab annotation file (contains digits + time ranges)')
+    parser.add_argument('--mode', choices=['digit', 'sequence', 'seq2seq'], default='sequence',
                         help='Verification mode (default: sequence)')
+    parser.add_argument('--n_digits', type=int, default=None,
+                        help='Required for seq2seq mode when no .lab is provided')
     parser.add_argument('--model_path', type=str, default=None,
                         help='Path to model checkpoint')
     parser.add_argument('--face_model', type=str, default=FACE_MODEL_PATH,
                         help=f'Path to face landmarker model (default: {FACE_MODEL_PATH})')
     args = parser.parse_args()
 
-    model_path = args.model_path or os.path.join(MODEL_DIR, f'best_{args.mode}_verifier.pt')
+    if args.mode == 'seq2seq':
+        if args.lab is None and args.n_digits is None:
+            print('ERROR: seq2seq inference needs --lab or --n_digits to define segmentation length')
+            exit(1)
+    else:
+        if args.lab is None and args.digits is None:
+            print('ERROR: verification modes need --digits or --lab')
+            exit(1)
+        if args.lab is not None and args.digits is not None:
+            print('ERROR: provide only one of --digits or --lab')
+            exit(1)
+
+    default_model_name = {
+        'digit': 'best_digit_verifier.pt',
+        'sequence': 'best_sequence_verifier.pt',
+        'seq2seq': 'best_seq2seq.pt',
+    }[args.mode]
+    model_path = args.model_path or os.path.join(MODEL_DIR, default_model_name)
 
     if not os.path.exists(args.video):
         print(f"ERROR: Video not found: {args.video}")
@@ -303,36 +408,69 @@ if __name__ == '__main__':
     print(f"  {num_frames} frames @ {fps:.1f} FPS")
 
     features = compute_features(all_lm)
+    rms = extract_rms_from_video(args.video, num_frames, fps)
+    features = np.column_stack([features, rms])
     print(f"  Features shape: {features.shape}")
 
     # 3. Parse digits and segment
+    digits = None
     if args.lab:
         digits, alignments = parse_lab_file(args.lab, fps)
         segments = segment_by_time(features, alignments, num_frames)
         print(f"  Digits from .lab: {' '.join(digits)}")
     else:
-        digits = args.digits.strip().split()
-        n_digits = len(digits)
-        # Auto-segment using lip aperture minima (mouth closes between digits)
-        print(f"  No .lab provided — auto-segmenting by lip aperture minima...")
-        segments = segment_by_aperture(features, n_digits, fps)
-        print(f"  Digits: {' '.join(digits)}")
+        if args.mode == 'seq2seq':
+            if args.n_digits is None:
+                print('ERROR: seq2seq inference needs --lab or --n_digits to define segmentation length')
+                exit(1)
+            n_digits = args.n_digits
+            print(f"  No .lab provided — auto-segmenting by lip aperture minima...")
+            segments = segment_by_aperture(features, n_digits, fps)
+        else:
+            digits = args.digits.strip().split()
+            n_digits = len(digits)
+            # Auto-segment using lip aperture minima (mouth closes between digits)
+            print(f"  No .lab provided — auto-segmenting by lip aperture minima...")
+            segments = segment_by_aperture(features, n_digits, fps)
+            print(f"  Digits: {' '.join(digits)}")
 
-    # Validate digits
-    for d in digits:
-        if d not in CHAR_TO_IDX:
-            print(f"ERROR: Unknown digit '{d}'. Valid: {VOCAB}")
-            exit(1)
+    state_dict = torch.load(model_path, map_location=DEVICE, weights_only=True)
+    n_features = infer_input_feature_dim(state_dict)
+    features = adapt_feature_dim(features, n_features)
+    segments = [adapt_feature_dim(seg, n_features) for seg in segments]
+    n_digits = infer_n_digits_from_segments(segments)
+
+    if digits is not None:
+        # Validate digits when a claimed sequence is available.
+        for d in digits:
+            if d not in CHAR_TO_IDX:
+                print(f"ERROR: Unknown digit '{d}'. Valid: {VOCAB}")
+                exit(1)
 
     # 4. Load model
     if args.mode == 'digit':
         model = DigitVerifier(n_classes=N_CLASSES, embed_dim=EMBED_DIM,
-                              n_features=N_FEATURES, hidden_dim=HIDDEN_DIM).to(DEVICE)
-    else:
+                              n_features=n_features, hidden_dim=HIDDEN_DIM).to(DEVICE)
+    elif args.mode == 'sequence':
         model = SequenceVerifier(n_classes=N_CLASSES, embed_dim=EMBED_DIM,
-                                 n_features=N_FEATURES, hidden_dim=HIDDEN_DIM).to(DEVICE)
+                                 n_features=n_features, hidden_dim=HIDDEN_DIM).to(DEVICE)
+    else:
+        model = TinyLipSeq2Seq(
+            vocab_size=SEQ2SEQ_VOCAB_SIZE,
+            pad_idx=PAD_IDX,
+            n_features=n_features,
+            seg_embed_dim=48,
+            n_heads=4,
+            n_encoder_layers=1,
+            n_decoder_layers=1,
+            ff_dim=128,
+            dropout=0.1,
+            max_src_len=12,
+            max_tgt_len=12,
+            hidden_dim=64,
+        ).to(DEVICE)
 
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
+    model.load_state_dict(state_dict)
     model.eval()
     print(f"  Loaded model: {model_path}")
 
@@ -341,7 +479,13 @@ if __name__ == '__main__':
     print(f"  Mode: {args.mode}")
     print(f"{'='*50}")
 
-    if args.mode == 'sequence':
+    if args.mode == 'seq2seq':
+        pred_ids = infer_seq2seq(model, segments, DEVICE, max_len=(n_digits + 1))
+        pred_digits = [VOCAB[i] for i in pred_ids]
+        print(f"\n  Predicted digits: {' '.join(pred_digits) if pred_digits else '(empty)'}")
+        if args.lab:
+            print(f"  Ground truth: {' '.join(digits)}")
+    elif args.mode == 'sequence':
         prob = infer_sequence(model, segments, digits, DEVICE)
         print(f"\n  Claimed digits: {' '.join(digits)}")
         print(f"  Sequence probability: {prob:.4f}")

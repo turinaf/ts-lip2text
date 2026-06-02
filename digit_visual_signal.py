@@ -4,6 +4,62 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import numpy as np
 import matplotlib.pyplot as plt
+import os
+
+def plot_rms_energy_from_npz(npz_path, sample_idx=0, save_path=None):
+    """Plot RMS energy for a sample from processed .npz, with digit segments highlighted."""
+    data = np.load(npz_path, allow_pickle=True)
+    full_features = data['full_features'][sample_idx]  # (T, n_features)
+    digit_sequence = data['digit_sequences'][sample_idx]
+    alignments = data['digit_segments'][sample_idx]  # list of (T_digit, n_features)
+    fps = data['fps'][sample_idx]
+    video_id = data['video_ids'][sample_idx]
+    feature_names = data['feature_names']
+
+    # RMS energy is last column
+    rms = full_features[:, -1]
+    time_axis = np.arange(len(rms)) / fps
+
+    # For segment highlighting, need frame indices for each digit
+    # We reconstruct from lengths of digit_segments
+    seg_lengths = [seg.shape[0] for seg in alignments]
+    seg_ends = np.cumsum(seg_lengths)
+    seg_starts = np.concatenate([[0], seg_ends[:-1]])
+
+    fig, ax = plt.subplots(figsize=(14, 3))
+    ax.plot(time_axis, rms, color='gray', lw=1, label='RMS energy')
+
+    cmap = plt.get_cmap('tab10')
+    for i, (start, end, digit) in enumerate(zip(seg_starts, seg_ends, digit_sequence)):
+        t = time_axis[start:end]
+        r = rms[start:end]
+        color = cmap(i % 10)
+        ax.plot(t, r, color=color, lw=2, label=f"{digit}" if i == 0 or digit not in digit_sequence[:i] else "")
+        if len(t) > 0:
+            ax.text((t[0]+t[-1])/2, np.max(r)+0.01, str(digit), color=color, fontsize=9, ha='center')
+
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('RMS Energy')
+    ax.set_title(f'RMS Energy (audio) for sample {video_id}')
+    ax.grid(True, linestyle='--', alpha=0.4)
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax.legend(by_label.values(), by_label.keys(), fontsize=8, loc='upper right')
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+
+
+# --- Main block for RMS visualization ---
+if __name__ == "__main__":
+    # Example usage: visualize RMS for first train sample
+    npz_path = os.path.join('processed_data', 'train.npz')
+    if os.path.exists(npz_path):
+        plot_rms_energy_from_npz(npz_path, sample_idx=0, save_path='rms_energy_sample0.png')
+    else:
+        print(f"File not found: {npz_path}")
+
 
 # --- 1. Configuration ---
 video_path = 'data/lipdata-digit/subset_05/1003/video/1003_20161115142134_35396787.mp4'
