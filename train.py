@@ -16,13 +16,13 @@ from dataset import (
     LipVerificationDataset,
     SequenceVerificationDataset,
 )
-from model import DigitVerifier, N_CLASSES, SequenceVerifier, TinyLipSeq2Seq
+from model import DigitVerifier, SequenceVerifier, TinyLipSeq2Seq
 
 # --- Configuration ---
-PROCESSED_DIR = 'processed_data'
-MODEL_DIR = 'models'
-LOG_DIR = 'runs'
-os.makedirs(MODEL_DIR, exist_ok=True)
+PROCESSED_ROOT = 'processed_data'
+MODEL_ROOT = 'models'
+LOG_ROOT = 'runs'
+os.makedirs(MODEL_ROOT, exist_ok=True)
 
 # Hyperparameters
 MAX_SEQ_LEN = 30        # max frames per digit segment (pad/truncate)
@@ -38,10 +38,10 @@ DEVICE = torch.device(
     else 'cpu'
 )
 
-PAD_IDX = N_CLASSES
-BOS_IDX = N_CLASSES + 1
-EOS_IDX = N_CLASSES + 2
-SEQ2SEQ_VOCAB_SIZE = N_CLASSES + 3
+PAD_IDX = None
+BOS_IDX = None
+EOS_IDX = None
+SEQ2SEQ_VOCAB_SIZE = None
 
 
 def sequence_collate_fn(batch):
@@ -115,6 +115,19 @@ def transcription_collate_fn(batch):
         torch.stack(batch_src_pad),
         torch.stack(batch_targets),
     )
+
+
+def _dataset_paths(dataset_name):
+    processed_dir = os.path.join(PROCESSED_ROOT, dataset_name)
+    model_dir = os.path.join(MODEL_ROOT, dataset_name)
+    log_dir = os.path.join(LOG_ROOT, dataset_name)
+    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+    return processed_dir, model_dir, log_dir
+
+
+def _max_sequence_length(dataset):
+    return max(len(seq) for seq in dataset.digit_sequences)
 
 
 # --- Training ---
@@ -270,6 +283,12 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        '--dataset',
+        choices=['digit', 'grid'],
+        default='digit',
+        help='Select processed_data/<dataset> and dataset-specific vocabulary.',
+    )
+    parser.add_argument(
         '--mode',
         choices=['digit', 'sequence', 'seq2seq'],
         default='sequence',
@@ -281,41 +300,66 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     print(f'Device: {DEVICE}')
-    train_path = os.path.join(PROCESSED_DIR, 'train.npz')
-    test_path = os.path.join(PROCESSED_DIR, 'test.npz')
+    processed_dir, model_dir, log_dir = _dataset_paths(args.dataset)
+    train_path = os.path.join(processed_dir, 'train.npz')
+    test_path = os.path.join(processed_dir, 'test.npz')
 
     if not os.path.exists(train_path):
         print('ERROR: Preprocessed data not found. Run preprocess.py first.')
         raise SystemExit(1)
 
-    print(f'\nMode: {args.mode}')
-    print(f'Vocabulary: {N_CLASSES} classes (0-9 + !)')
+    print(f'\nDataset: {args.dataset}')
+    print(f'Mode: {args.mode}')
     print('Loading data...')
 
     if args.mode == 'digit':
-        train_ds = LipVerificationDataset(train_path)
-        test_ds = LipVerificationDataset(test_path, seed=99)
+        train_ds = LipVerificationDataset(train_path, dataset=args.dataset)
+        test_ds = LipVerificationDataset(
+            test_path,
+            dataset=args.dataset,
+            token_to_idx=train_ds.token_to_idx,
+            seed=99,
+        )
         n_features = train_ds.n_features
+        n_classes = train_ds.vocab_size
         model = DigitVerifier(
-            n_classes=N_CLASSES,
+            n_classes=n_classes,
             embed_dim=EMBED_DIM,
             n_features=n_features,
             hidden_dim=HIDDEN_DIM,
         ).to(DEVICE)
     elif args.mode == 'sequence':
-        train_ds = SequenceVerificationDataset(train_path)
-        test_ds = SequenceVerificationDataset(test_path, seed=99)
+        train_ds = SequenceVerificationDataset(train_path, dataset=args.dataset)
+        test_ds = SequenceVerificationDataset(
+            test_path,
+            dataset=args.dataset,
+            token_to_idx=train_ds.token_to_idx,
+            seed=99,
+        )
         n_features = train_ds.n_features
+        n_classes = train_ds.vocab_size
+        seq_len = max(_max_sequence_length(train_ds), _max_sequence_length(test_ds))
         model = SequenceVerifier(
-            n_classes=N_CLASSES,
+            n_classes=n_classes,
             embed_dim=EMBED_DIM,
+            seq_len=seq_len,
             n_features=n_features,
             hidden_dim=HIDDEN_DIM,
         ).to(DEVICE)
     else:
-        train_ds = LipTranscriptionDataset(train_path)
-        test_ds = LipTranscriptionDataset(test_path)
+        train_ds = LipTranscriptionDataset(train_path, dataset=args.dataset)
+        test_ds = LipTranscriptionDataset(
+            test_path,
+            dataset=args.dataset,
+            token_to_idx=train_ds.token_to_idx,
+        )
         n_features = train_ds.n_features
+        n_classes = train_ds.vocab_size
+        seq_len = max(_max_sequence_length(train_ds), _max_sequence_length(test_ds))
+        PAD_IDX = n_classes
+        BOS_IDX = n_classes + 1
+        EOS_IDX = n_classes + 2
+        SEQ2SEQ_VOCAB_SIZE = n_classes + 3
         model = TinyLipSeq2Seq(
             vocab_size=SEQ2SEQ_VOCAB_SIZE,
             pad_idx=PAD_IDX,
@@ -326,10 +370,21 @@ if __name__ == '__main__':
             n_decoder_layers=1,
             ff_dim=128,
             dropout=0.1,
-            max_src_len=12,
-            max_tgt_len=12,
+            max_src_len=seq_len,
+            max_tgt_len=seq_len + 1,
             hidden_dim=64,
         ).to(DEVICE)
+
+    if args.mode != 'seq2seq':
+        n_classes = train_ds.vocab_size
+        print(f'Vocabulary size: {n_classes}')
+    else:
+        print(f'Vocabulary size: {n_classes} tokens (+3 special tokens)')
+
+    vocab_path = os.path.join(model_dir, 'vocab.json')
+    with open(vocab_path, 'w') as f:
+        json.dump(train_ds.token_to_idx, f, indent=2)
+    print(f'Vocabulary saved to {vocab_path}')
 
     collate_fn = None
     if args.mode == 'sequence':
@@ -366,14 +421,14 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    run_name = f'{args.mode}_lr{args.lr}_bs{args.batch_size}_{time.strftime("%Y%m%d_%H%M%S")}'
-    writer = SummaryWriter(log_dir=os.path.join(LOG_DIR, run_name))
-    print(f'TensorBoard logs: {LOG_DIR}/{run_name}')
+    run_name = f'{args.dataset}_{args.mode}_lr{args.lr}_bs{args.batch_size}_{time.strftime("%Y%m%d_%H%M%S")}'
+    writer = SummaryWriter(log_dir=os.path.join(log_dir, run_name))
+    print(f'TensorBoard logs: {log_dir}/{run_name}')
 
     best_metric = float('-inf')
     results_log = []
     model_suffix = 'seq2seq' if args.mode == 'seq2seq' else f'{args.mode}_verifier'
-    model_save_path = os.path.join(MODEL_DIR, f'best_{model_suffix}.pt')
+    model_save_path = os.path.join(model_dir, f'best_{model_suffix}.pt')
 
     print(f'\nTraining for {args.epochs} epochs...')
 
@@ -471,13 +526,14 @@ if __name__ == '__main__':
     writer.close()
 
     results = {
+        'dataset': args.dataset,
         'mode': args.mode,
         'hyperparams': {
             'hidden_dim': HIDDEN_DIM,
             'batch_size': args.batch_size,
             'lr': args.lr,
             'epochs': args.epochs,
-            'n_classes': N_CLASSES,
+            'n_classes': n_classes,
         },
         'final_metrics': {
             k: float(v) if isinstance(v, (float, np.floating)) else v
@@ -486,7 +542,7 @@ if __name__ == '__main__':
         'training_log': results_log,
     }
     results_suffix = 'seq2seq' if args.mode == 'seq2seq' else args.mode
-    results_path = os.path.join(MODEL_DIR, f'results_{results_suffix}.json')
+    results_path = os.path.join(model_dir, f'results_{results_suffix}.json')
     with open(results_path, 'w') as f:
         json.dump(
             results,

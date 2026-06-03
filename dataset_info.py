@@ -95,8 +95,8 @@ def print_single_video_all_features(path: Path, video_idx: int = 0) -> None:
 
 
 def main() -> None:
-	train_path = Path("processed_data/train.npz")
-	test_path = Path("processed_data/test.npz")
+	train_path = Path("processed_data/digit/train.npz")
+	test_path = Path("processed_data/digit/test.npz")
 
 	if not train_path.exists() or not test_path.exists():
 		raise FileNotFoundError("Expected files: processed_data/train.npz and processed_data/test.npz")

@@ -157,17 +157,15 @@ def _is_number(s):
         return False
 
 
-def parse_annotation(lab_path, fps, num_frames=None):
+def parse_annotation(lab_path, fps, num_frames=None, dataset='digit'):
     with open(lab_path) as f:
         lines = [ln.strip() for ln in f if ln.strip()]
 
     if not lines:
         return [], []
 
-    first_parts = lines[0].split()
-
-    # GRID/HTK style alignments: "<start> <end> <token>"
-    if len(first_parts) >= 3 and _is_number(first_parts[0]) and _is_number(first_parts[1]):
+    if dataset == 'grid':
+        # GRID/HTK style alignments: "<start> <end> <token>"
         raw_entries = []
         max_end = 0.0
         for ln in lines:
@@ -199,13 +197,16 @@ def parse_annotation(lab_path, fps, num_frames=None):
         return tokens, alignments
 
     # Digit dataset style:
-    # line 1: tokens
+    # line 1: tokens (e.g. "2 6 8 0 9 2 9 8")
     # line 2: per-token time ranges "ss-es"
     if len(lines) < 2:
         return [], []
 
     tokens = lines[0].split()
     time_ranges = lines[1].split()
+    if len(tokens) != len(time_ranges):
+        return [], []
+
     alignments = []
     for tok, tr in zip(tokens, time_ranges):
         if '-' not in tr:
@@ -400,7 +401,12 @@ def main():
                     else:
                         rms = np.zeros(len(all_lm), dtype=np.float32)
                     features = np.column_stack([visual_features, rms])
-                    token_seq, alignments = parse_annotation(lab_path, fps, num_frames=len(all_lm))
+                    token_seq, alignments = parse_annotation(
+                        lab_path,
+                        fps,
+                        num_frames=len(all_lm),
+                        dataset=args.dataset,
+                    )
                     if not alignments:
                         failed_videos.append((video_id, "empty alignment"))
                         continue

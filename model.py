@@ -45,12 +45,15 @@ class LipEncoder(nn.Module):
         h = h.permute(0, 2, 1)               # (B, T, 64)
         h, _ = self.gru(h)                   # (B, T, hidden*2)
 
-        # Masked mean pooling
-        mask_exp = mask.unsqueeze(-1)         # (B, T, 1)
-        attn_w = self.attn(h).squeeze(-1)          # (B, T)
-        attn_w = attn_w.masked_fill(~mask.bool(), float('-inf'))
-        attn_w = torch.softmax(attn_w, dim=1).unsqueeze(-1)
-        h = (h * attn_w).sum(dim=1)               # (B, hidden*2)
+        # Safe masked attention pooling.
+        # For all-padded segments, this yields a zero vector instead of NaN.
+        valid = mask.bool()                    # (B, T)
+        attn_w = self.attn(h).squeeze(-1)     # (B, T)
+        attn_w = attn_w.masked_fill(~valid, -1e9)
+        attn_w = torch.softmax(attn_w, dim=1)
+        attn_w = attn_w * valid.float()
+        attn_w = attn_w / attn_w.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        h = (h * attn_w.unsqueeze(-1)).sum(dim=1)  # (B, hidden*2)
         return self.fc(h)                     # (B, embed_dim)
 
 
