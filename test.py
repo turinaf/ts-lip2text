@@ -31,6 +31,12 @@ def char_to_idx(c):
     return CHAR_TO_IDX[c]
 
 
+def _default_model_path(mode, encoder_type):
+    if encoder_type == 'transformer':
+        return os.path.join(MODEL_DIR, 'transformer_encoder', f'best_{mode}_verifier.pt')
+    return os.path.join(MODEL_DIR, f'best_{mode}_verifier.pt')
+
+
 # --- Datasets (same as train.py) ---
 class LipVerificationDataset(Dataset):
     def __init__(self, npz_path, max_seq_len=MAX_SEQ_LEN, neg_ratio=1, seed=99):
@@ -279,8 +285,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test lip-text verification model')
     parser.add_argument('--mode', choices=['digit', 'sequence'], default='sequence',
                         help='digit: per-digit, sequence: full 8-digit')
+    parser.add_argument('--encoder', choices=['bigru', 'transformer'], default='transformer',
+                        help='Encoder variant used by the checkpoint.')
     parser.add_argument('--model_path', type=str, default=None,
-                        help='Path to model checkpoint (default: models/best_{mode}_verifier.pt)')
+                        help='Path to model checkpoint (default depends on --encoder)')
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--threshold', type=float, default=None,
                         help='Custom decision threshold (default: use EER threshold)')
@@ -288,7 +296,7 @@ if __name__ == '__main__':
                         help='Save detailed results to JSON')
     args = parser.parse_args()
 
-    model_path = args.model_path or os.path.join(MODEL_DIR, f'best_{args.mode}_verifier.pt')
+    model_path = args.model_path or _default_model_path(args.mode, args.encoder)
     test_path = os.path.join(PROCESSED_DIR, 'test.npz')
 
     if not os.path.exists(test_path):
@@ -300,15 +308,18 @@ if __name__ == '__main__':
 
     print(f"Device: {DEVICE}")
     print(f"Mode: {args.mode}-level verification")
+    print(f"Encoder: {args.encoder}")
     print(f"Model: {model_path}")
 
     # Load model
     if args.mode == 'digit':
         model = DigitVerifier(n_classes=N_CLASSES, embed_dim=EMBED_DIM,
-                              n_features=N_FEATURES, hidden_dim=HIDDEN_DIM).to(DEVICE)
+                              n_features=N_FEATURES, hidden_dim=HIDDEN_DIM,
+                              encoder_type=args.encoder).to(DEVICE)
     else:
         model = SequenceVerifier(n_classes=N_CLASSES, embed_dim=EMBED_DIM,
-                                 n_features=N_FEATURES, hidden_dim=HIDDEN_DIM).to(DEVICE)
+                                 n_features=N_FEATURES, hidden_dim=HIDDEN_DIM,
+                                 encoder_type=args.encoder).to(DEVICE)
 
     model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -355,6 +366,7 @@ if __name__ == '__main__':
     if args.save:
         output = {
             'mode': args.mode,
+            'encoder': args.encoder,
             'model_path': model_path,
             'metrics': metrics,
             'confusion_matrix': cm.tolist(),
@@ -362,7 +374,8 @@ if __name__ == '__main__':
         if digit_stats:
             output['per_digit'] = digit_stats
 
-        out_path = os.path.join(MODEL_DIR, f'test_results_{args.mode}.json')
+        save_dir = os.path.dirname(model_path) or MODEL_DIR
+        out_path = os.path.join(save_dir, f'test_results_{args.mode}.json')
         with open(out_path, 'w') as f:
             json.dump(output, f, indent=2)
         print(f"Results saved to {out_path}")

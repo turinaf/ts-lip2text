@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+import argparse
 
 from model import CHAR_TO_IDX, N_CLASSES, VOCAB
 
@@ -8,6 +9,13 @@ from model import CHAR_TO_IDX, N_CLASSES, VOCAB
 MAX_SEQ_LEN = 30
 NEG_RATIO = 1
 EXPECTED_N_DIGITS = 8
+FEATURE_NAME_TO_INDEX = {
+    'vertical_aperture': 0,
+    'horizontal_spread': 1,
+    'inner_lip_area': 2,
+    'compactness': 3,
+    'lip_speed': 4,
+}
 
 
 
@@ -65,6 +73,15 @@ def _prepare_samples(npz_path, dataset='digit', expected_len=EXPECTED_N_DIGITS):
     data = np.load(npz_path, allow_pickle=True)
     digit_segments = data['digit_segments']
     digit_sequences = data['digit_sequences']
+
+    # Digit dataset is expected to contain fixed-length sequences (default: 8).
+    # GRID uses variable-length word sequences, so we keep all samples.
+    if dataset == 'digit':
+        digit_segments, digit_sequences = _filter_fixed_length_samples(
+            digit_segments,
+            digit_sequences,
+            expected_len=expected_len,
+        )
 
     token_to_idx = _build_token_to_idx(digit_sequences, dataset=dataset)
     return digit_segments, digit_sequences, token_to_idx
@@ -135,7 +152,7 @@ class LipVerificationDataset(Dataset):
 
 class SequenceVerificationDataset(Dataset):
     """
-    Full-sequence verification: verify entire 8-digit sequence at once.
+    Full-sequence verification: verify an entire token sequence at once.
     """
 
     def __init__(self, npz_path, dataset='digit', token_to_idx=None,
@@ -260,3 +277,70 @@ class LipTranscriptionDataset(Dataset):
             torch.LongTensor(digits),
             n_digits,
         )
+
+
+def _print_sample_summary(ds, sample_idx, dataset_name, feature_name='lip_speed'):
+    feats, masks, digits, n_tokens = ds[sample_idx]
+    idx_to_token = {idx: tok for tok, idx in ds.token_to_idx.items()}
+    decoded = [idx_to_token[int(x)] for x in digits[:n_tokens]]
+
+    print(f'Sample {sample_idx}')
+    print(f'- n_tokens={n_tokens}')
+    print(f'- tokens={decoded}')
+    print(f'- features_shape={tuple(feats.shape)}')
+    print(f'- masks_shape={tuple(masks.shape)}')
+
+    feature_idx = FEATURE_NAME_TO_INDEX[feature_name]
+    feature_values = []
+    for token_idx in range(n_tokens):
+        valid_len = int(masks[token_idx].sum().item())
+        if valid_len > 0:
+            feature_values.extend(feats[token_idx, :valid_len, feature_idx].tolist())
+    print(f'- {feature_name}_vector_len={len(feature_values)}')
+    print(f'- {feature_name}_vector={feature_values}')
+
+    if dataset_name == 'digit':
+        print(f"- as_digit_string={''.join(decoded)}")
+    else:
+        print(f"- as_phrase={' '.join(decoded)}")
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description='Inspect preprocessed lip-reading datasets.')
+    parser.add_argument('--dataset', choices=['digit', 'grid'], default='digit', help='Dataset type.')
+    parser.add_argument('--split', choices=['train', 'test'], default='train', help='Data split to inspect.')
+    parser.add_argument('--npz-path', default='', help='Optional explicit .npz path override.')
+    parser.add_argument('--samples', type=int, default=3, help='Number of samples to print.')
+    parser.add_argument('--max-seg-len', type=int, default=MAX_SEQ_LEN, help='Max frames per segment for padding/truncation.')
+    parser.add_argument(
+        '--feature-name',
+        choices=list(FEATURE_NAME_TO_INDEX.keys()),
+        default='lip_speed',
+        help='Feature trajectory to print across the full video.',
+    )
+    return parser.parse_args()
+
+
+def _default_npz_path(dataset_name, split):
+    return f'processed_data/{dataset_name}/{split}.npz'
+
+
+if __name__ == '__main__':
+    args = _parse_args()
+    npz_path = args.npz_path or _default_npz_path(args.dataset, args.split)
+
+    ds = LipTranscriptionDataset(
+        npz_path=npz_path,
+        dataset=args.dataset,
+        max_seg_len=args.max_seg_len,
+    )
+
+    print(f'Dataset loaded from: {npz_path}')
+    print(f'- dataset={args.dataset}')
+    print(f'- split={args.split}')
+    print(f'- size={len(ds)}')
+    print(f'- vocab_size={ds.vocab_size}')
+
+    n_show = min(args.samples, len(ds))
+    for i in range(n_show):
+        _print_sample_summary(ds, i, args.dataset, feature_name=args.feature_name)

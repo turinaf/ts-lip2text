@@ -1,7 +1,7 @@
 """
 Lip-Text Verification Models
 -----------------------------
-LipEncoder: 1D-CNN + BiGRU encoder for lip segment time series
+LipEncoder: 1D-CNN + lightweight encoder for lip segment time series
 DigitVerifier: per-digit verification (lip segment vs single digit)
 SequenceVerifier: full 8-digit sequence verification
 """
@@ -19,8 +19,20 @@ N_CLASSES = len(VOCAB)  # 11
 
 class LipEncoder(nn.Module):
     """Encode a lip segment time series into a fixed-size embedding."""
-    def __init__(self, n_features=5, hidden_dim=128, embed_dim=64):
+
+    def __init__(
+        self,
+        n_features=5,
+        hidden_dim=128,
+        embed_dim=64,
+        encoder_type='transformer',
+        transformer_heads=4,
+        transformer_layers=2,
+        transformer_ff_dim=128,
+        max_frames=256,
+    ):
         super().__init__()
+        self.encoder_type = encoder_type
         self.conv = nn.Sequential(
             nn.Conv1d(n_features, 32, kernel_size=3, padding=1),          # dilation=1
             nn.BatchNorm1d(32),
@@ -32,9 +44,52 @@ class LipEncoder(nn.Module):
             nn.BatchNorm1d(64),
             nn.ReLU(),
         )
-        self.gru = nn.GRU(64, hidden_dim, batch_first=True, bidirectional=True)
-        self.fc = nn.Linear(hidden_dim * 2, embed_dim)
-        self.attn = nn.Linear(hidden_dim * 2, 1)  # add to __init__
+        encoder_output_dim = hidden_dim if encoder_type == 'transformer' else hidden_dim * 2
+        self.fc = nn.Linear(encoder_output_dim, embed_dim)
+        self.attn = nn.Linear(encoder_output_dim, 1)
+
+        if encoder_type == 'transformer':
+            self.input_proj = nn.Linear(64, hidden_dim)
+            self.pos_emb = nn.Embedding(max_frames, hidden_dim)
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=transformer_heads,
+                dim_feedforward=transformer_ff_dim,
+                dropout=0.1,
+                batch_first=True,
+                norm_first=True,
+                activation='gelu',
+            )
+            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=transformer_layers)
+        elif encoder_type == 'bigru':
+            self.gru = nn.GRU(64, hidden_dim, batch_first=True, bidirectional=True)
+        else:
+            raise ValueError(f'Unknown encoder_type: {encoder_type}')
+
+    def _masked_attention_pool(self, h, mask):
+        valid = mask.bool()
+        attn_w = self.attn(h).squeeze(-1)
+        attn_w = attn_w.masked_fill(~valid, -1e9)
+        attn_w = torch.softmax(attn_w, dim=1)
+        attn_w = attn_w * valid.float()
+        attn_w = attn_w / attn_w.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        return (h * attn_w.unsqueeze(-1)).sum(dim=1)
+
+    def _encode_transformer(self, h, mask):
+        valid = mask.bool()
+        h = self.input_proj(h)
+        pos = torch.arange(h.size(1), device=h.device).unsqueeze(0)
+        h = h + self.pos_emb(pos)
+
+        encoded = torch.zeros_like(h)
+        valid_rows = valid.any(dim=1)
+        if valid_rows.any():
+            encoded_valid = self.encoder(
+                h[valid_rows],
+                src_key_padding_mask=~valid[valid_rows],
+            )
+            encoded[valid_rows] = encoded_valid
+        return encoded
 
     def forward(self, x, mask):
         """
@@ -43,25 +98,34 @@ class LipEncoder(nn.Module):
         """
         h = self.conv(x.permute(0, 2, 1))   # (B, 64, T)
         h = h.permute(0, 2, 1)               # (B, T, 64)
-        h, _ = self.gru(h)                   # (B, T, hidden*2)
+        if self.encoder_type == 'transformer':
+            h = self._encode_transformer(h, mask)
+        else:
+            h, _ = self.gru(h)                   # (B, T, hidden*2)
 
         # Safe masked attention pooling.
         # For all-padded segments, this yields a zero vector instead of NaN.
-        valid = mask.bool()                    # (B, T)
-        attn_w = self.attn(h).squeeze(-1)     # (B, T)
-        attn_w = attn_w.masked_fill(~valid, -1e9)
-        attn_w = torch.softmax(attn_w, dim=1)
-        attn_w = attn_w * valid.float()
-        attn_w = attn_w / attn_w.sum(dim=1, keepdim=True).clamp(min=1e-8)
-        h = (h * attn_w.unsqueeze(-1)).sum(dim=1)  # (B, hidden*2)
+        h = self._masked_attention_pool(h, mask)
         return self.fc(h)                     # (B, embed_dim)
 
 
 class DigitVerifier(nn.Module):
     """Per-digit verification: compare lip embedding with digit/char embedding."""
-    def __init__(self, n_classes=N_CLASSES, embed_dim=64, n_features=5, hidden_dim=128):
+    def __init__(
+        self,
+        n_classes=N_CLASSES,
+        embed_dim=64,
+        n_features=5,
+        hidden_dim=128,
+        encoder_type='transformer',
+    ):
         super().__init__()
-        self.lip_encoder = LipEncoder(n_features, hidden_dim, embed_dim)
+        self.lip_encoder = LipEncoder(
+            n_features,
+            hidden_dim,
+            embed_dim,
+            encoder_type=encoder_type,
+        )
         self.digit_embedding = nn.Embedding(n_classes, embed_dim)
         self.classifier = nn.Sequential(
             nn.Linear(embed_dim * 4, 64),
@@ -91,9 +155,14 @@ class SequenceVerifier(nn.Module):
     Encodes each segment, compares with claimed digit, aggregates scores.
     """
     def __init__(self, n_classes=N_CLASSES, embed_dim=64, seq_len=8,
-                 n_features=5, hidden_dim=128):
+                 n_features=5, hidden_dim=128, encoder_type='transformer'):
         super().__init__()
-        self.lip_encoder = LipEncoder(n_features, hidden_dim, embed_dim)
+        self.lip_encoder = LipEncoder(
+            n_features,
+            hidden_dim,
+            embed_dim,
+            encoder_type=encoder_type,
+        )
         self.digit_embedding = nn.Embedding(n_classes, embed_dim)
         self.digit_compare = nn.Sequential(
             nn.Linear(embed_dim * 2, 64),
@@ -149,6 +218,7 @@ class TinyLipSeq2Seq(nn.Module):
         max_src_len=12,
         max_tgt_len=12,
         hidden_dim=64,
+        encoder_type='transformer',
     ):
         super().__init__()
         self.pad_idx = pad_idx
@@ -156,6 +226,7 @@ class TinyLipSeq2Seq(nn.Module):
             n_features=n_features,
             hidden_dim=hidden_dim,
             embed_dim=seg_embed_dim,
+            encoder_type=encoder_type,
         )
         self.src_pos_emb = nn.Embedding(max_src_len, seg_embed_dim)
         self.tgt_tok_emb = nn.Embedding(vocab_size, seg_embed_dim)

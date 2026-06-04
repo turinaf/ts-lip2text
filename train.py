@@ -31,7 +31,7 @@ EMBED_DIM = 64          # embedding dimension
 HIDDEN_DIM = 128        # GRU hidden dimension
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
-N_EPOCHS = 50
+N_EPOCHS = 100
 DEVICE = torch.device(
     'cuda' if torch.cuda.is_available()
     else 'mps' if torch.backends.mps.is_available()
@@ -124,6 +124,18 @@ def _dataset_paths(dataset_name):
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
     return processed_dir, model_dir, log_dir
+
+
+def _output_dirs(dataset_name, encoder_type):
+    if encoder_type == 'transformer':
+        model_dir = os.path.join(MODEL_ROOT, 'transformer_encoder')
+        log_dir = os.path.join(LOG_ROOT, 'transformer_encoder')
+    else:
+        model_dir = os.path.join(MODEL_ROOT, dataset_name)
+        log_dir = os.path.join(LOG_ROOT, dataset_name)
+    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+    return model_dir, log_dir
 
 
 def _max_sequence_length(dataset):
@@ -294,6 +306,12 @@ if __name__ == '__main__':
         default='sequence',
         help='digit: per-digit verification, sequence: sequence verification, seq2seq: transcription',
     )
+    parser.add_argument(
+        '--encoder',
+        choices=['bigru', 'transformer'],
+        default='transformer',
+        help='Sequence encoder for the lip feature extractor.',
+    )
     parser.add_argument('--epochs', type=int, default=N_EPOCHS)
     parser.add_argument('--batch_size', type=int, default=BATCH_SIZE)
     parser.add_argument('--lr', type=float, default=LEARNING_RATE)
@@ -301,6 +319,7 @@ if __name__ == '__main__':
 
     print(f'Device: {DEVICE}')
     processed_dir, model_dir, log_dir = _dataset_paths(args.dataset)
+    model_dir, log_dir = _output_dirs(args.dataset, args.encoder)
     train_path = os.path.join(processed_dir, 'train.npz')
     test_path = os.path.join(processed_dir, 'test.npz')
 
@@ -310,6 +329,7 @@ if __name__ == '__main__':
 
     print(f'\nDataset: {args.dataset}')
     print(f'Mode: {args.mode}')
+    print(f'Encoder: {args.encoder}')
     print('Loading data...')
 
     if args.mode == 'digit':
@@ -327,6 +347,7 @@ if __name__ == '__main__':
             embed_dim=EMBED_DIM,
             n_features=n_features,
             hidden_dim=HIDDEN_DIM,
+            encoder_type=args.encoder,
         ).to(DEVICE)
     elif args.mode == 'sequence':
         train_ds = SequenceVerificationDataset(train_path, dataset=args.dataset)
@@ -345,6 +366,7 @@ if __name__ == '__main__':
             seq_len=seq_len,
             n_features=n_features,
             hidden_dim=HIDDEN_DIM,
+            encoder_type=args.encoder,
         ).to(DEVICE)
     else:
         train_ds = LipTranscriptionDataset(train_path, dataset=args.dataset)
@@ -373,6 +395,7 @@ if __name__ == '__main__':
             max_src_len=seq_len,
             max_tgt_len=seq_len + 1,
             hidden_dim=64,
+            encoder_type=args.encoder,
         ).to(DEVICE)
 
     if args.mode != 'seq2seq':
@@ -529,6 +552,7 @@ if __name__ == '__main__':
         'dataset': args.dataset,
         'mode': args.mode,
         'hyperparams': {
+            'encoder_type': args.encoder,
             'hidden_dim': HIDDEN_DIM,
             'batch_size': args.batch_size,
             'lr': args.lr,

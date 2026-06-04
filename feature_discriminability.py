@@ -13,6 +13,7 @@ Run:
     python feature_discriminability.py [--mode digit|sequence]
 """
 import argparse
+import json
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -20,7 +21,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.feature_selection import mutual_info_classif
 import os
 
-from model import DigitVerifier, SequenceVerifier, CHAR_TO_IDX, N_CLASSES
+from model import DigitVerifier, SequenceVerifier
 from train import (LipVerificationDataset, SequenceVerificationDataset,
                    sequence_collate_fn, N_FEATURES,
                    EMBED_DIM, HIDDEN_DIM, PROCESSED_ROOT, MODEL_ROOT)
@@ -163,15 +164,29 @@ def permuted_auc(model, loader, feat_idx, mode, rng, n_repeats=5):
 # Utilities
 # ---------------------------------------------------------------------------
 
-def load_segments_by_digit(npz_path):
+def _load_token_to_idx(npz_path, model_dir):
+    vocab_path = os.path.join(model_dir, 'vocab.json')
+    if os.path.exists(vocab_path):
+        with open(vocab_path, 'r') as f:
+            token_to_idx = json.load(f)
+        # Ensure indices are integers even if loaded from JSON.
+        return {str(k): int(v) for k, v in token_to_idx.items()}
+
+    data = np.load(npz_path, allow_pickle=True)
+    digit_sequences = data['digit_sequences']
+    vocab = sorted({str(token) for seq in digit_sequences for token in np.asarray(seq).tolist()})
+    return {token: idx for idx, token in enumerate(vocab)}
+
+
+def load_segments_by_digit(npz_path, token_to_idx):
     data = np.load(npz_path, allow_pickle=True)
     digit_segments = data['digit_segments']
     digit_sequences = data['digit_sequences']
 
-    by_digit = {d: [] for d in range(N_CLASSES)}
+    by_digit = {d: [] for d in range(len(token_to_idx))}
     for vid_segs, vid_digits in zip(digit_segments, digit_sequences):
         for seg, digit in zip(vid_segs, vid_digits):
-            idx = CHAR_TO_IDX[str(digit)]
+            idx = token_to_idx[str(digit)]
             by_digit[idx].append(seg)
     return by_digit
 
@@ -203,12 +218,14 @@ if __name__ == '__main__':
     model_dir = os.path.join(MODEL_ROOT, args.dataset)
     test_path = os.path.join(processed_dir, 'test.npz')
     model_path = os.path.join(model_dir, f'best_{args.mode}_verifier.pt')
+    token_to_idx = _load_token_to_idx(test_path, model_dir)
+    n_classes = len(token_to_idx)
 
     # ---- 1 & 2: Model-free methods ----------------------------------------
     print("Loading segments...")
-    by_digit = load_segments_by_digit(test_path)
+    by_digit = load_segments_by_digit(test_path, token_to_idx)
     n_segs = sum(len(v) for v in by_digit.values())
-    print(f"  {n_segs} digit segments across {N_CLASSES} classes")
+    print(f"  {n_segs} digit segments across {n_classes} classes")
 
     fdr = fisher_discriminant_ratio(by_digit)
     print_ranking(fdr, "Fisher Discriminant Ratio (higher = more separable)")
@@ -222,15 +239,33 @@ if __name__ == '__main__':
     else:
         print(f"\nLoading model from {model_path}...")
         if args.mode == 'digit':
-            model = DigitVerifier(n_classes=N_CLASSES, embed_dim=EMBED_DIM,
-                                  n_features=N_FEATURES, hidden_dim=HIDDEN_DIM).to(DEVICE)
-            dataset = LipVerificationDataset(test_path, seed=99)
+            dataset = LipVerificationDataset(
+                test_path,
+                dataset=args.dataset,
+                token_to_idx=token_to_idx,
+                seed=99,
+            )
+            model = DigitVerifier(
+                n_classes=dataset.vocab_size,
+                embed_dim=EMBED_DIM,
+                n_features=dataset.n_features,
+                hidden_dim=HIDDEN_DIM,
+            ).to(DEVICE)
             loader = DataLoader(dataset, batch_size=256, shuffle=False,
                                 num_workers=0, collate_fn=None)
         else:
-            model = SequenceVerifier(n_classes=N_CLASSES, embed_dim=EMBED_DIM,
-                                     n_features=N_FEATURES, hidden_dim=HIDDEN_DIM).to(DEVICE)
-            dataset = SequenceVerificationDataset(test_path, seed=99)
+            dataset = SequenceVerificationDataset(
+                test_path,
+                dataset=args.dataset,
+                token_to_idx=token_to_idx,
+                seed=99,
+            )
+            model = SequenceVerifier(
+                n_classes=dataset.vocab_size,
+                embed_dim=EMBED_DIM,
+                n_features=dataset.n_features,
+                hidden_dim=HIDDEN_DIM,
+            ).to(DEVICE)
             loader = DataLoader(dataset, batch_size=64, shuffle=False,
                                 num_workers=0, collate_fn=sequence_collate_fn)
 

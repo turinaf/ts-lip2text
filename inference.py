@@ -36,6 +36,12 @@ BOS_IDX = N_CLASSES + 1
 EOS_IDX = N_CLASSES + 2
 SEQ2SEQ_VOCAB_SIZE = N_CLASSES + 3
 
+
+def _default_model_path(mode, encoder_type):
+    if encoder_type == 'transformer':
+        return os.path.join(MODEL_DIR, 'transformer_encoder', f'best_{mode}_verifier.pt')
+    return os.path.join(MODEL_DIR, f'best_{mode}_verifier.pt')
+
 # Lip landmark indices
 OUTER_LIP = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291,
              185, 40, 39, 37, 0, 267, 269, 270, 409]
@@ -357,6 +363,8 @@ if __name__ == '__main__':
                         help='Required for seq2seq mode when no .lab is provided')
     parser.add_argument('--model_path', type=str, default=None,
                         help='Path to model checkpoint')
+    parser.add_argument('--encoder', choices=['bigru', 'transformer'], default='transformer',
+                        help='Encoder variant used by the checkpoint')
     parser.add_argument('--face_model', type=str, default=FACE_MODEL_PATH,
                         help=f'Path to face landmarker model (default: {FACE_MODEL_PATH})')
     args = parser.parse_args()
@@ -373,12 +381,11 @@ if __name__ == '__main__':
             print('ERROR: provide only one of --digits or --lab')
             exit(1)
 
-    default_model_name = {
-        'digit': 'best_digit_verifier.pt',
-        'sequence': 'best_sequence_verifier.pt',
-        'seq2seq': 'best_seq2seq.pt',
-    }[args.mode]
-    model_path = args.model_path or os.path.join(MODEL_DIR, default_model_name)
+    model_path = args.model_path or (
+        os.path.join(MODEL_DIR, 'best_seq2seq.pt')
+        if args.mode == 'seq2seq'
+        else _default_model_path(args.mode, args.encoder)
+    )
 
     if not os.path.exists(args.video):
         print(f"ERROR: Video not found: {args.video}")
@@ -450,10 +457,12 @@ if __name__ == '__main__':
     # 4. Load model
     if args.mode == 'digit':
         model = DigitVerifier(n_classes=N_CLASSES, embed_dim=EMBED_DIM,
-                              n_features=n_features, hidden_dim=HIDDEN_DIM).to(DEVICE)
+                              n_features=n_features, hidden_dim=HIDDEN_DIM,
+                              encoder_type=args.encoder).to(DEVICE)
     elif args.mode == 'sequence':
         model = SequenceVerifier(n_classes=N_CLASSES, embed_dim=EMBED_DIM,
-                                 n_features=n_features, hidden_dim=HIDDEN_DIM).to(DEVICE)
+                                 n_features=n_features, hidden_dim=HIDDEN_DIM,
+                                 encoder_type=args.encoder).to(DEVICE)
     else:
         model = TinyLipSeq2Seq(
             vocab_size=SEQ2SEQ_VOCAB_SIZE,
@@ -468,10 +477,12 @@ if __name__ == '__main__':
             max_src_len=12,
             max_tgt_len=12,
             hidden_dim=64,
+            encoder_type=args.encoder,
         ).to(DEVICE)
 
     model.load_state_dict(state_dict)
     model.eval()
+    print(f"  Encoder: {args.encoder}")
     print(f"  Loaded model: {model_path}")
 
     # 5. Run inference

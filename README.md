@@ -4,43 +4,8 @@ Lip-based digit verification and transcription from time-series facial landmarks
 The project supports:
 
 - sequence-level verification (`--mode sequence`)
-- per-digit verification (`--mode digit`)
-- seq2seq transcription (`--mode seq2seq`)
+- per-digit (per word) verification (`--mode digit`)
 
-## Current Pipeline
-
-```text
-Video (.mp4) + Lab Annotation (.lab) + Audio (.wav, optional)
-        |
-        v
-preprocess.py
-  - extract MediaPipe landmarks
-  - compute 8D frame-level features
-  - segment by .lab alignments
-  - split by speaker (no speaker overlap)
-        |
-        v
-processed_data/
-  - train.npz
-  - test.npz
-  - metadata.json
-        |
-        v
-train.py
-  - digit / sequence / seq2seq training
-        |
-        v
-models/
-  - best_digit_verifier.pt
-  - best_sequence_verifier.pt
-  - best_seq2seq.pt
-  - results_digit.json
-  - results_sequence.json
-  - results_seq2seq.json
-        |
-        v
-test.py / inference.py
-```
 
 ## Features (Current)
 
@@ -97,13 +62,6 @@ GRID layout (supported via `--dataset grid`):
 For GRID, alignment/audio are read from `../liptev/data/grid/sXX_processed`, and
 the video is resolved from `../data/sXX_processed/<same_basename>.mpg`.
 
-## Installation
-
-Python 3.10+ is recommended.
-
-```bash
-pip install numpy torch torchvision torchaudio opencv-python mediapipe librosa scipy scikit-learn tqdm tensorboard
-```
 
 ## Usage
 
@@ -112,8 +70,6 @@ pip install numpy torch torchvision torchaudio opencv-python mediapipe librosa s
 ```bash
 python preprocess.py
 
-# GRID (single speaker example: s10)
-python preprocess.py --dataset grid --grid-speakers s10
 
 # GRID (all speakers found under ../liptev/data/grid)
 python preprocess.py --dataset grid
@@ -127,9 +83,9 @@ python preprocess.py --dataset grid --no-resume
 
 This generates:
 
-- `processed_data/train.npz`
-- `processed_data/test.npz`
-- `processed_data/metadata.json`
+- `processed_data/grid/train.npz`
+- `processed_data/grid/test.npz`
+- `processed_data/grid/metadata.json`
 
 Notes:
 
@@ -143,6 +99,9 @@ Notes:
 ```bash
 # Sequence-level verification (default)
 python train.py --mode sequence --epochs 50
+
+# Use the lightweight transformer encoder explicitly
+python train.py --mode sequence --encoder transformer --epochs 50
 
 # Digit-level verification
 python train.py --mode digit --epochs 50
@@ -159,6 +118,8 @@ Training outputs:
 - checkpoints in `models/`
 - metrics json in `models/results_<mode>.json`
 - TensorBoard logs in `runs/`
+
+Transformer-encoder runs are written under `models/transformer_encoder/` and `runs/transformer_encoder/` so they do not overwrite the older BiGRU results.
 
 ```bash
 tensorboard --logdir runs/
