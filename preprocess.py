@@ -15,6 +15,8 @@ import os
 import glob
 import json
 import argparse
+import hashlib
+import shutil
 from collections import defaultdict
 
 # --- Configuration ---
@@ -62,8 +64,109 @@ def parse_args():
                         help='GRID original root containing s*_processed speaker dirs with uncropped .mpg videos.')
     parser.add_argument('--grid-speakers', default='',
                         help='Comma-separated speaker IDs (e.g., s10,s11). Empty means all available speakers.')
+    parser.add_argument('--no-resume', action='store_true',
+                        help='Disable resumable per-video cache for GRID preprocessing.')
+    parser.add_argument('--reset-resume', action='store_true',
+                        help='Delete existing GRID resume cache before preprocessing.')
 
     return parser.parse_args()
+
+
+def _resume_cache_dir(output_dir):
+    return os.path.join(output_dir, '_resume_grid')
+
+
+def _resume_manifest_path(cache_dir):
+    return os.path.join(cache_dir, 'manifest.json')
+
+
+def _resume_sample_path(cache_dir, video_id):
+    digest = hashlib.sha1(video_id.encode('utf-8')).hexdigest()
+    return os.path.join(cache_dir, f'{digest}.npz')
+
+
+def _save_cached_sample(cache_dir, sample):
+    os.makedirs(cache_dir, exist_ok=True)
+    dst = _resume_sample_path(cache_dir, sample['video_id'])
+    tmp = dst + '.tmp.npz'
+    digit_segments = np.empty(len(sample['digit_segments']), dtype=object)
+    for i, seg in enumerate(sample['digit_segments']):
+        digit_segments[i] = seg
+
+    np.savez_compressed(
+        tmp,
+        video_id=np.array(sample['video_id']),
+        speaker=np.array(sample['speaker']),
+        split=np.array(sample['split']),
+        digit_sequence=np.array(sample['digit_sequence'], dtype=object),
+        full_features=sample['full_features'],
+        digit_segments=digit_segments,
+        fps=np.array(float(sample['fps']), dtype=np.float32),
+    )
+    os.replace(tmp, dst)
+
+
+def _load_cached_sample(cache_dir, video_id):
+    path = _resume_sample_path(cache_dir, video_id)
+    data = np.load(path, allow_pickle=True)
+    segments_obj = data['digit_segments']
+    digit_segments = [segments_obj[i] for i in range(len(segments_obj))]
+    return {
+        'video_id': str(data['video_id'].item()),
+        'speaker': str(data['speaker'].item()),
+        'split': str(data['split'].item()),
+        'digit_sequence': data['digit_sequence'].tolist(),
+        'full_features': data['full_features'],
+        'digit_segments': digit_segments,
+        'fps': float(data['fps'].item()),
+    }
+
+
+def _build_resume_manifest(args, train_speakers, test_speakers):
+    selected_speakers = sorted(
+        [s.strip() for s in args.grid_speakers.split(',') if s.strip()]
+    ) if args.grid_speakers.strip() else []
+
+    return {
+        'dataset': args.dataset,
+        'seed': int(args.seed),
+        'test_speaker_ratio': float(args.test_speaker_ratio),
+        'grid_processed_root': os.path.abspath(args.grid_processed_root),
+        'grid_original_root': os.path.abspath(args.grid_original_root),
+        'grid_speakers': selected_speakers,
+        'train_speakers': sorted(train_speakers),
+        'test_speakers': sorted(test_speakers),
+    }
+
+
+def _init_resume_cache(args, output_dir, train_speakers, test_speakers):
+    resume_enabled = args.dataset == 'grid' and not args.no_resume
+    if not resume_enabled:
+        return False, None
+
+    cache_dir = _resume_cache_dir(output_dir)
+    manifest_path = _resume_manifest_path(cache_dir)
+
+    if args.reset_resume and os.path.isdir(cache_dir):
+        shutil.rmtree(cache_dir)
+        print(f'Reset GRID resume cache: {cache_dir}')
+
+    os.makedirs(cache_dir, exist_ok=True)
+
+    manifest = _build_resume_manifest(args, train_speakers, test_speakers)
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as f:
+            old_manifest = json.load(f)
+        if old_manifest != manifest:
+            raise RuntimeError(
+                'Existing GRID resume cache is incompatible with current arguments. '
+                'Use --reset-resume to clear it or --no-resume to ignore cache.'
+            )
+    else:
+        with open(manifest_path, 'w') as f:
+            json.dump(manifest, f, indent=2)
+
+    return True, cache_dir
 
 
 # --- Feature extraction functions ---
@@ -344,10 +447,20 @@ def main():
     print(f"Train speakers: {len(train_speakers)}, Test speakers: {len(test_speakers)}")
     print(f"Test speakers: {sorted(test_speakers)}")
 
+    resume_enabled, resume_cache_dir = _init_resume_cache(
+        args,
+        output_dir,
+        train_speakers,
+        test_speakers,
+    )
+    if resume_enabled:
+        print(f"GRID resume cache enabled at: {resume_cache_dir}")
+
     # Storage: per-utterance segments with metadata
     all_samples = []
     failed_videos = []
     total_videos = 0
+    resumed_samples = 0
 
     for speaker in sorted(train_speakers | test_speakers):
         source_entries = speaker_dirs_map[speaker]
@@ -388,6 +501,23 @@ def main():
                 total_videos += 1
                 if total_videos % 50 == 0:
                     print(f"  Processing video {total_videos}...")
+
+                if resume_enabled:
+                    cache_path = _resume_sample_path(resume_cache_dir, video_id)
+                    if os.path.exists(cache_path):
+                        try:
+                            cached_sample = _load_cached_sample(resume_cache_dir, video_id)
+                            expected_split = 'test' if speaker in test_speakers else 'train'
+                            if cached_sample['speaker'] == speaker and cached_sample['split'] == expected_split:
+                                all_samples.append(cached_sample)
+                                resumed_samples += 1
+                                continue
+                        except Exception:
+                            # Corrupt cache entry: recompute this sample.
+                            try:
+                                os.remove(cache_path)
+                            except OSError:
+                                pass
 
                 try:
                     all_lm, fps = extract_landmarks(video_path, detector)
@@ -438,11 +568,16 @@ def main():
                         'fps': fps,
                     })
 
+                    if resume_enabled:
+                        _save_cached_sample(resume_cache_dir, all_samples[-1])
+
                 except Exception as e:
                     failed_videos.append((video_id, str(e)))
                     continue
 
     print(f"\nProcessed {total_videos} videos total")
+    if resume_enabled:
+        print(f"Reused from cache: {resumed_samples}")
     print(f"Successful: {len(all_samples)}, Failed: {len(failed_videos)}")
     if failed_videos:
         print(f"First 10 failures:")
@@ -484,6 +619,7 @@ def main():
         'test_digit_dist': dict(sorted(test_digit_count.items())),
         'n_failed': len(failed_videos),
         'digits_per_video': 8 if args.dataset == 'digit' else None,
+        'resumed_from_cache': resumed_samples if resume_enabled else 0,
     }
     with open(os.path.join(output_dir, 'metadata.json'), 'w') as f:
         json.dump(metadata, f, indent=2)

@@ -1,7 +1,7 @@
 """
 Feature Discriminability Evaluation
 -------------------------------------
-Evaluates which of the 5 lip features are most discriminative using
+Evaluates which of the lip features are most discriminative using
 methods that do NOT require retraining:
 
   1. Fisher Discriminant Ratio (FDR) — class-separability on raw features
@@ -22,13 +22,22 @@ import os
 
 from model import DigitVerifier, SequenceVerifier, CHAR_TO_IDX, N_CLASSES
 from train import (LipVerificationDataset, SequenceVerificationDataset,
-                   sequence_collate_fn, MAX_SEQ_LEN, N_FEATURES,
-                   EMBED_DIM, HIDDEN_DIM, PROCESSED_DIR, MODEL_DIR)
+                   sequence_collate_fn, N_FEATURES,
+                   EMBED_DIM, HIDDEN_DIM, PROCESSED_ROOT, MODEL_ROOT)
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else
                       'mps' if torch.backends.mps.is_available() else 'cpu')
 
-FEATURE_NAMES = ['vert_aperture', 'horiz_spread', 'inner_area', 'compactness', 'lip_speed']
+FEATURE_NAMES = [
+    'vert_aperture',
+    'outer_vert_aperture',
+    'horiz_spread',
+    'inner_area',
+    'outer_area',
+    'compactness',
+    'lip_speed',
+    'rms_energy',
+]
 
 # ---------------------------------------------------------------------------
 # 1. Fisher Discriminant Ratio
@@ -37,19 +46,19 @@ FEATURE_NAMES = ['vert_aperture', 'horiz_spread', 'inner_area', 'compactness', '
 def fisher_discriminant_ratio(segments_by_digit):
     """
     For each feature, compute FDR = between-class variance / within-class variance.
-    segments_by_digit: dict {digit_idx: list of (T, 5) arrays}
-    We summarise each segment by its mean over time → shape (N, 5) per digit.
+    segments_by_digit: dict {digit_idx: list of (T, N_FEATURES) arrays}
+    We summarise each segment by its mean over time → shape (N, N_FEATURES) per digit.
     """
     all_classes = [d for d in sorted(segments_by_digit.keys()) if len(segments_by_digit[d]) > 0]
 
-    # Per-class mean vectors: (n_classes, 5)
+    # Per-class mean vectors: (n_classes, N_FEATURES)
     class_means = {}
     class_vars  = {}
     class_counts = {}
     for d in all_classes:
         segs = segments_by_digit[d]
-        # Summarise each segment: concatenate mean and std → (N, 10) → use mean only here
-        X = np.stack([s.mean(axis=0) for s in segs])   # (N, 5)
+        # Summarise each segment by temporal mean only: (N, N_FEATURES)
+        X = np.stack([s.mean(axis=0) for s in segs])   # (N, N_FEATURES)
         class_means[d]  = X.mean(axis=0)
         class_vars[d]   = X.var(axis=0)
         class_counts[d] = len(X)
@@ -63,7 +72,7 @@ def fisher_discriminant_ratio(segments_by_digit):
                   for d in all_classes) / n_total
 
     fdr = between / (within + 1e-12)
-    return fdr   # (5,)
+    return fdr   # (N_FEATURES,)
 
 
 # ---------------------------------------------------------------------------
@@ -72,18 +81,18 @@ def fisher_discriminant_ratio(segments_by_digit):
 
 def mutual_information(segments_by_digit):
     """
-    Build a feature matrix X of shape (N_segments, 10) — per-segment mean + std
+    Build a feature matrix X of shape (N_segments, 2*N_FEATURES) — per-segment mean + std
     of each feature — and a label vector y.
-    Returns MI scores of shape (5,) averaged over mean and std representations.
+    Returns MI scores of shape (N_FEATURES,) averaged over mean and std representations.
     """
     X_rows, y_rows = [], []
     for digit, segs in sorted(segments_by_digit.items()):
         for s in segs:
-            row = np.concatenate([s.mean(axis=0), s.std(axis=0)])  # (10,)
+            row = np.concatenate([s.mean(axis=0), s.std(axis=0)])  # (2*N_FEATURES,)
             X_rows.append(row)
             y_rows.append(digit)
 
-    X = np.array(X_rows)   # (N, 10)
+    X = np.array(X_rows)   # (N, 2*N_FEATURES)
     y = np.array(y_rows)
 
     mi = mutual_info_classif(X, y, discrete_features=False, random_state=42)
@@ -184,13 +193,16 @@ def print_ranking(scores, label):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', choices=['digit', 'grid'], default='digit')
     parser.add_argument('--mode', choices=['digit', 'sequence'], default='digit')
     parser.add_argument('--perm_repeats', type=int, default=5,
                         help='Number of permutation repeats per feature (more = stabler estimate)')
     args = parser.parse_args()
 
-    test_path = os.path.join(PROCESSED_DIR, 'test.npz')
-    model_path = os.path.join(MODEL_DIR, f'best_{args.mode}_verifier.pt')
+    processed_dir = os.path.join(PROCESSED_ROOT, args.dataset)
+    model_dir = os.path.join(MODEL_ROOT, args.dataset)
+    test_path = os.path.join(processed_dir, 'test.npz')
+    model_path = os.path.join(model_dir, f'best_{args.mode}_verifier.pt')
 
     # ---- 1 & 2: Model-free methods ----------------------------------------
     print("Loading segments...")

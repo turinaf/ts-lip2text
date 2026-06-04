@@ -117,6 +117,12 @@ python preprocess.py --dataset grid --grid-speakers s10
 
 # GRID (all speakers found under ../liptev/data/grid)
 python preprocess.py --dataset grid
+
+# GRID with resume cache reset (start fresh)
+python preprocess.py --dataset grid --reset-resume
+
+# GRID without resume cache
+python preprocess.py --dataset grid --no-resume
 ```
 
 This generates:
@@ -129,6 +135,8 @@ Notes:
 
 - speaker-disjoint split (`TEST_SPEAKER_RATIO = 0.1`)
 - failed samples are reported in preprocessing logs
+- GRID preprocessing now resumes automatically using per-video cache under `processed_data/grid/_resume_grid`
+- if preprocessing arguments or speaker split change, resume cache is rejected to avoid mixing incompatible runs
 
 ### 2) Train
 
