@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lip2Text Verification Demo</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="page">
+    <section class="hero card">
+      <p class="eyebrow">TS Lip2Text</p>
+      <h1>Web Verification Demo</h1>
+      <p class="subtitle">Read the prompted sequence, record your video with live lip landmarks, and verify with the trained model.</p>
+    </section>
+
+    <section class="workspace">
+      <div class="card control-panel">
+        <h2>Prompt Setup</h2>
+        <div class="field-row">
+          <label for="datasetSelect">Dataset</label>
+          <select id="datasetSelect">
+            <option value="digit">Digit (8 digits)</option>
+            <option value="grid">GRID (word sequence)</option>
+          </select>
+        </div>
+
+        <div class="field-row">
+          <label for="promptInput">Prompt to Read</label>
+          <textarea id="promptInput" rows="2" placeholder="Generate a prompt or edit it manually."></textarea>
+        </div>
+
+        <div class="btn-row">
+          <button id="generateBtn" class="btn secondary" type="button">Generate Prompt</button>
+          <button id="startCameraBtn" class="btn ghost" type="button">Start Camera</button>
+        </div>
+
+        <div class="btn-row">
+          <button id="recordBtn" class="btn primary" type="button" disabled>Start Recording</button>
+          <button id="stopBtn" class="btn warn" type="button" disabled>Stop Recording</button>
+          <button id="submitBtn" class="btn accent" type="button" disabled>Submit</button>
+        </div>
+
+        <p id="statusText" class="status idle">Idle</p>
+      </div>
+
+      <div class="card video-panel">
+        <h2>Live Capture</h2>
+        <div class="video-stack">
+          <video id="videoEl" playsinline muted></video>
+          <canvas id="overlayCanvas"></canvas>
+        </div>
+        <p class="hint">Landmark overlay highlights lip contours in real-time.</p>
+      </div>
+    </section>
+
+    <section class="card result-panel">
+      <h2>Verification Result</h2>
+      <div id="resultEmpty" class="placeholder">No submission yet.</div>
+      <div id="resultContent" class="hidden">
+        <div class="metric-row">
+          <span>Prompt</span>
+          <strong id="resultPrompt"></strong>
+        </div>
+        <div class="metric-row">
+          <span>Probability</span>
+          <strong id="resultProb"></strong>
+        </div>
+        <div class="metric-row">
+          <span>Threshold</span>
+          <strong id="resultThreshold"></strong>
+        </div>
+        <div class="metric-row">
+          <span>Frames / FPS</span>
+          <strong id="resultFrames"></strong>
+        </div>
+        <div id="resultBadge" class="badge"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
