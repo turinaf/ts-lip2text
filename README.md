@@ -9,7 +9,7 @@ The project supports:
 
 ## Features (Current)
 
-The model now uses **8 features per frame**:
+The core visual pipeline uses **7 features per frame**:
 
 1. inner vertical aperture
 2. outer vertical aperture
@@ -18,7 +18,10 @@ The model now uses **8 features per frame**:
 5. outer lip area
 6. compactness
 7. lip speed
-8. RMS audio energy
+
+Optional:
+
+8. RMS audio energy (enabled with `--use-audio-rms`)
 
 Spatial terms are normalized by inter-ocular distance. Detailed formulas are in [FEATURES.md](FEATURES.md).
 
@@ -70,6 +73,9 @@ the video is resolved from `../data/sXX_processed/<same_basename>.mpg`.
 ```bash
 python preprocess.py
 
+# Include audio RMS as the 8th feature
+python preprocess.py --use-audio-rms
+
 
 # GRID (all speakers found under ../liptev/data/grid)
 python preprocess.py --dataset grid
@@ -79,6 +85,9 @@ python preprocess.py --dataset grid --reset-resume
 
 # GRID without resume cache
 python preprocess.py --dataset grid --no-resume
+
+# GRID + audio RMS
+python preprocess.py --dataset grid --use-audio-rms
 ```
 
 This generates:
@@ -156,6 +165,9 @@ python inference.py --video path/to/video.mp4 --lab path/to/file.lab --mode seq2
 
 # Seq2seq transcription with auto segmentation length
 python inference.py --video path/to/video.mp4 --mode seq2seq --n_digits 8
+
+# Add RMS from the video audio track at inference time
+python inference.py --video path/to/video.mp4 --digits "1 3 5 7 9 2 4 6" --mode sequence --use-audio-rms
 ```
 
 Important CLI constraints:

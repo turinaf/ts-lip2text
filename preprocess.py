@@ -6,7 +6,6 @@ Preprocess the full lip-reading dataset:
 - Save as .npz for downstream training
 """
 import cv2
-import librosa
 import mediapipe as mp_lib
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -44,7 +43,22 @@ IDX_RIGHT_CORNER = 291
 LEFT_EYE_OUTER = 33
 RIGHT_EYE_OUTER = 263
 
-FEATURE_NAMES = ['vert_aperture', 'outer_vert_aperture', 'horiz_spread', 'inner_area', 'outer_area', 'compactness', 'lip_speed', 'rms_energy']
+VISUAL_FEATURE_NAMES = [
+    'vert_aperture',
+    'outer_vert_aperture',
+    'horiz_spread',
+    'inner_area',
+    'outer_area',
+    'compactness',
+    'lip_speed',
+]
+RMS_FEATURE_NAME = 'rms_energy'
+
+
+def build_feature_names(use_audio_rms):
+    if use_audio_rms:
+        return VISUAL_FEATURE_NAMES + [RMS_FEATURE_NAME]
+    return VISUAL_FEATURE_NAMES.copy()
 
 
 def parse_args():
@@ -53,6 +67,11 @@ def parse_args():
     parser.add_argument('--output-dir', default=DEFAULT_OUTPUT_DIR, help='Output directory for train/test .npz and metadata.')
     parser.add_argument('--test-speaker-ratio', type=float, default=TEST_SPEAKER_RATIO, help='Speaker-level test split ratio.')
     parser.add_argument('--seed', type=int, default=RANDOM_SEED, help='Random seed for speaker split.')
+    parser.add_argument(
+        '--use-audio-rms',
+        action='store_true',
+        help='Append rms_energy computed from audio to each frame feature vector.',
+    )
 
     # Digit dataset options
     parser.add_argument('--digit-data-dir', default=DEFAULT_DIGIT_DATA_DIR, help='Root path of digit dataset (contains subset_*/speaker dirs).')
@@ -136,6 +155,7 @@ def _build_resume_manifest(args, train_speakers, test_speakers):
         'grid_speakers': selected_speakers,
         'train_speakers': sorted(train_speakers),
         'test_speakers': sorted(test_speakers),
+        'use_audio_rms': bool(args.use_audio_rms),
     }
 
 
@@ -172,6 +192,8 @@ def _init_resume_cache(args, output_dir, train_speakers, test_speakers):
 # --- Feature extraction functions ---
 def extract_rms(audio_path, num_frames, fps):
     """Load audio and return per-video-frame RMS energy, shape (num_frames,)."""
+    import librosa
+
     y, sr = librosa.load(audio_path, sr=None, mono=True)
     hop_length = max(1, int(sr / fps))
     rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]  # (n_audio_frames,)
@@ -364,7 +386,7 @@ def collect_grid_speaker_dirs(processed_root, original_root, selected_speakers=N
     return speaker_dirs_map
 
 
-def save_split(samples, filepath):
+def save_split(samples, filepath, feature_names):
     """Save samples as .npz — variable-length sequences stored as object arrays."""
     video_ids = []
     speakers = []
@@ -396,7 +418,7 @@ def save_split(samples, filepath):
         full_features=full_features_arr,
         digit_segments=digit_segments_arr,
         fps=np.array(fps_list),
-        feature_names=np.array(FEATURE_NAMES),
+        feature_names=np.array(feature_names),
     )
     print(f"Saved {len(samples)} samples to {filepath}")
 
@@ -404,10 +426,12 @@ def save_split(samples, filepath):
 def main():
     # --- Main preprocessing ---
     args = parse_args()
+    feature_names = build_feature_names(args.use_audio_rms)
     output_dir = os.path.join(args.output_dir, args.dataset)
     os.makedirs(output_dir, exist_ok=True)
 
     print("Initializing face landmarker...")
+    print(f"Audio RMS enabled: {args.use_audio_rms}")
     base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
     options = vision.FaceLandmarkerOptions(
         base_options=base_options,
@@ -526,11 +550,13 @@ def main():
                         continue
 
                     visual_features = compute_features(all_lm)
-                    if os.path.exists(audio_path):
-                        rms = extract_rms(audio_path, len(all_lm), fps)
-                    else:
-                        rms = np.zeros(len(all_lm), dtype=np.float32)
-                    features = np.column_stack([visual_features, rms])
+                    features = visual_features
+                    if args.use_audio_rms:
+                        if os.path.exists(audio_path):
+                            rms = extract_rms(audio_path, len(all_lm), fps)
+                        else:
+                            rms = np.zeros(len(all_lm), dtype=np.float32)
+                        features = np.column_stack([features, rms])
                     token_seq, alignments = parse_annotation(
                         lab_path,
                         fps,
@@ -604,13 +630,14 @@ def main():
     print(f"\nTrain digit distribution: {dict(sorted(train_digit_count.items()))}")
     print(f"Test digit distribution:  {dict(sorted(test_digit_count.items()))}")
 
-    save_split(train_samples, os.path.join(output_dir, 'train.npz'))
-    save_split(test_samples, os.path.join(output_dir, 'test.npz'))
+    save_split(train_samples, os.path.join(output_dir, 'train.npz'), feature_names)
+    save_split(test_samples, os.path.join(output_dir, 'test.npz'), feature_names)
 
     metadata = {
         'dataset': args.dataset,
-        'n_features': len(FEATURE_NAMES),
-        'feature_names': FEATURE_NAMES,
+        'use_audio_rms': bool(args.use_audio_rms),
+        'n_features': len(feature_names),
+        'feature_names': feature_names,
         'n_train': len(train_samples),
         'n_test': len(test_samples),
         'train_speakers': sorted(train_speakers),

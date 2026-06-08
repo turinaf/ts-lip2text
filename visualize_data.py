@@ -1,19 +1,51 @@
 """
 Visualize samples from preprocessed train.npz
 ----------------------------------------------
-Shows per-digit time series features for selected samples.
+Shows per-token time series features for selected samples.
 """
 import numpy as np
 import matplotlib.pyplot as plt
 import argparse
 import os
 
-FEATURE_NAMES = ['Vert. Aperture', 'Horiz. Spread', 'Inner Lip Area', 'Compactness', 'Lip Speed']
-PROCESSED_DIR = 'processed_data'
+DEFAULT_FEATURE_NAMES = [
+    'vert_aperture',
+    'outer_vert_aperture',
+    'horiz_spread',
+    'inner_area',
+    'outer_area',
+    'compactness',
+    'lip_speed',
+    'rms_energy',
+]
 
 
-def plot_sample(full_features, digit_segments, digit_sequence, speaker, video_id, fps, ax_row=None, fig=None):
-    """Plot full video features + per-digit segment overlay for one sample."""
+def prettify_feature_name(name):
+    return str(name).replace('_', ' ').title()
+
+
+def get_feature_names(data, n_features):
+    if 'feature_names' in data:
+        names = [str(n) for n in data['feature_names'].tolist()]
+        if len(names) >= n_features:
+            return [prettify_feature_name(n) for n in names[:n_features]]
+
+    return [prettify_feature_name(n) for n in DEFAULT_FEATURE_NAMES[:n_features]]
+
+
+def plot_sample(
+    full_features,
+    token_segments,
+    token_sequence,
+    speaker,
+    video_id,
+    fps,
+    feature_names,
+    token_label='Tokens',
+    ax_row=None,
+    fig=None,
+):
+    """Plot full video features + per-token segment overlay for one sample."""
     n_features = full_features.shape[1]
     T = full_features.shape[0]
     time_axis = np.arange(T) / fps
@@ -21,11 +53,11 @@ def plot_sample(full_features, digit_segments, digit_sequence, speaker, video_id
     if ax_row is None:
         fig, ax_row = plt.subplots(n_features, 1, figsize=(14, 10), sharex=True)
 
-    colors = plt.cm.tab10(np.linspace(0, 1, len(digit_sequence)))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(token_sequence)))
 
     # Find true frame offsets for each segment by matching against full_features
     seg_offsets = []
-    for seg in digit_segments:
+    for seg in token_segments:
         seg_len = len(seg)
         best_offset = 0
         best_err = np.inf
@@ -42,32 +74,37 @@ def plot_sample(full_features, digit_segments, digit_sequence, speaker, video_id
         ax = ax_row[f_idx]
         ax.plot(time_axis, full_features[:, f_idx], color='gray', alpha=0.4, linewidth=0.8)
 
-        # Overlay per-digit segments at their true positions
-        for seg_idx, (seg, digit) in enumerate(zip(digit_segments, digit_sequence)):
+        # Overlay per-token segments at their true positions
+        for seg_idx, (seg, token) in enumerate(zip(token_segments, token_sequence)):
             t = (seg_offsets[seg_idx] + np.arange(len(seg))) / fps
             ax.plot(t, seg[:, f_idx], color=colors[seg_idx], linewidth=1.5,
-                    label=f"'{digit}'" if f_idx == 0 else None)
+                    label=f"'{token}'" if f_idx == 0 else None)
 
-        ax.set_ylabel(FEATURE_NAMES[f_idx], fontsize=9)
+        ax.set_ylabel(feature_names[f_idx], fontsize=9)
         ax.tick_params(labelsize=8)
         ax.grid(True, alpha=0.3)
 
     ax_row[-1].set_xlabel('Time (s)', fontsize=10)
-    ax_row[0].set_title(f'Speaker {speaker} — Video {video_id} — Digits: {" ".join(digit_sequence)}',
+    ax_row[0].set_title(f'Speaker {speaker} — Video {video_id} — {token_label}: {" ".join(map(str, token_sequence))}',
                         fontsize=11, fontweight='bold')
     if ax_row[0].get_legend() is None:
-        ax_row[0].legend(loc='upper right', fontsize=7, ncol=len(digit_sequence))
+        ax_row[0].legend(loc='upper right', fontsize=7, ncol=min(8, len(token_sequence)))
 
 
-def plot_digit_segments_grid(digit_segments, digit_sequence, speaker, video_id, fps):
-    """Plot each digit segment as a separate subplot column."""
-    n_digits = len(digit_sequence)
-    n_features = 5
-    fig, axes = plt.subplots(n_features, n_digits, figsize=(2.2 * n_digits, 8),
+def plot_token_segments_grid(token_segments, token_sequence, speaker, video_id, fps, feature_names, token_label='Token'):
+    """Plot each token segment as a separate subplot column."""
+    n_tokens = len(token_sequence)
+    n_features = len(feature_names)
+    fig, axes = plt.subplots(n_features, n_tokens, figsize=(2.2 * n_tokens, max(6, 1.2 * n_features)),
                              sharex=False, sharey='row')
 
-    for d_idx in range(n_digits):
-        seg = digit_segments[d_idx]
+    if n_features == 1:
+        axes = np.expand_dims(axes, axis=0)
+    if n_tokens == 1:
+        axes = np.expand_dims(axes, axis=1)
+
+    for d_idx in range(n_tokens):
+        seg = token_segments[d_idx]
         t = np.arange(len(seg)) / fps
         for f_idx in range(n_features):
             ax = axes[f_idx, d_idx]
@@ -75,25 +112,25 @@ def plot_digit_segments_grid(digit_segments, digit_sequence, speaker, video_id, 
             ax.grid(True, alpha=0.3)
             ax.tick_params(labelsize=6)
             if d_idx == 0:
-                ax.set_ylabel(FEATURE_NAMES[f_idx], fontsize=8)
+                ax.set_ylabel(feature_names[f_idx], fontsize=8)
             if f_idx == 0:
-                ax.set_title(f"'{digit_sequence[d_idx]}'", fontsize=10, fontweight='bold')
+                ax.set_title(f"'{token_sequence[d_idx]}'", fontsize=10, fontweight='bold')
             if f_idx == n_features - 1:
                 ax.set_xlabel('s', fontsize=7)
 
-    fig.suptitle(f'Per-Digit Segments — Speaker {speaker} — {video_id}',
+    fig.suptitle(f'Per-{token_label} Segments — Speaker {speaker} — {video_id}',
                  fontsize=12, fontweight='bold')
     fig.tight_layout()
     return fig
 
 
-def plot_digit_comparison(data, digit, max_samples=10):
-    """Compare the same digit across different videos/speakers."""
+def plot_token_comparison(data, token, feature_names, max_samples=10, token_label='token'):
+    """Compare the same token across different videos/speakers."""
     matches = []
     for i in range(len(data['digit_sequences'])):
         seq = data['digit_sequences'][i]
         for d_idx, d in enumerate(seq):
-            if str(d) == str(digit):
+            if str(d) == str(token):
                 matches.append((i, d_idx, data['speakers'][i]))
                 if len(matches) >= max_samples:
                     break
@@ -101,11 +138,13 @@ def plot_digit_comparison(data, digit, max_samples=10):
             break
 
     if not matches:
-        print(f"No segments found for digit '{digit}'")
+        print(f"No segments found for {token_label} '{token}'")
         return None
 
-    n_features = 5
+    n_features = len(feature_names)
     fig, axes = plt.subplots(n_features, 1, figsize=(12, 8), sharex=False)
+    if n_features == 1:
+        axes = np.array([axes])
 
     for m_idx, (vid_idx, d_idx, speaker) in enumerate(matches):
         seg = data['digit_segments'][vid_idx][d_idx]
@@ -115,12 +154,12 @@ def plot_digit_comparison(data, digit, max_samples=10):
         for f_idx in range(n_features):
             axes[f_idx].plot(t, seg[:, f_idx], color=color, alpha=0.7, linewidth=1,
                              label=f'spk {speaker}' if f_idx == 0 else None)
-            axes[f_idx].set_ylabel(FEATURE_NAMES[f_idx], fontsize=9)
+            axes[f_idx].set_ylabel(feature_names[f_idx], fontsize=9)
             axes[f_idx].grid(True, alpha=0.3)
             axes[f_idx].tick_params(labelsize=8)
 
     axes[-1].set_xlabel('Time (s)')
-    axes[0].set_title(f"Digit '{digit}' — {len(matches)} samples across speakers",
+    axes[0].set_title(f"{token_label.title()} '{token}' — {len(matches)} samples across speakers",
                       fontsize=12, fontweight='bold')
     axes[0].legend(loc='upper right', fontsize=7, ncol=min(5, len(matches)))
     fig.tight_layout()
@@ -129,27 +168,33 @@ def plot_digit_comparison(data, digit, max_samples=10):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Visualize preprocessed lip features')
+    parser.add_argument('--dataset', choices=['digit', 'grid'], default='digit',
+                        help='Dataset to visualize from processed_data/<dataset>')
     parser.add_argument('--split', choices=['train', 'test'], default='train')
     parser.add_argument('--n_samples', type=int, default=3,
                         help='Number of random samples to visualize')
     parser.add_argument('--index', type=int, nargs='+', default=None,
                         help='Specific sample indices to visualize')
     parser.add_argument('--digit', type=str, default=None,
-                        help='Compare a specific digit across samples')
+                        help='Compare a specific token across samples (name kept for compatibility)')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--save', action='store_true', help='Save plots instead of showing')
     args = parser.parse_args()
 
-    npz_path = os.path.join(PROCESSED_DIR, f'{args.split}.npz')
+    processed_dir = os.path.join('processed_data', args.dataset)
+    npz_path = os.path.join(processed_dir, f'{args.split}.npz')
     if not os.path.exists(npz_path):
-        print(f"ERROR: {npz_path} not found. Run preprocess.py first.")
+        print(f"ERROR: {npz_path} not found. Run preprocess.py --dataset {args.dataset} first.")
         exit(1)
 
     data = np.load(npz_path, allow_pickle=True)
+    n_features = data['full_features'][0].shape[1]
+    feature_names = get_feature_names(data, n_features)
+    token_label = 'Digit' if args.dataset == 'digit' else 'Token'
     n_videos = len(data['digit_segments'])
-    print(f"Loaded {args.split} set: {n_videos} videos")
+    print(f"Loaded {args.dataset}/{args.split} set: {n_videos} videos ({n_features} features)")
 
-    out_dir = 'plots'
+    out_dir = os.path.join('plots', args.dataset)
     if args.save:
         os.makedirs(out_dir, exist_ok=True)
 
@@ -169,12 +214,25 @@ if __name__ == '__main__':
         vid_id = data['video_ids'][idx]
         fps = data['fps'][idx]
 
-        print(f"\nSample {idx}: speaker={speaker}, digits={' '.join(str(d) for d in digits)}, "
+        print(f"\nSample {idx}: speaker={speaker}, tokens={' '.join(str(d) for d in digits)}, "
               f"frames={full_feat.shape[0]}, fps={fps}")
 
-        # Plot 1: Full video with segment overlay
-        fig, axes = plt.subplots(5, 1, figsize=(14, 10), sharex=True)
-        plot_sample(full_feat, segs, digits, speaker, vid_id, fps, ax_row=axes, fig=fig)
+        # Plot 1: Full video with token segment overlay
+        fig, axes = plt.subplots(n_features, 1, figsize=(14, max(8, 1.6 * n_features)), sharex=True)
+        if n_features == 1:
+            axes = np.array([axes])
+        plot_sample(
+            full_feat,
+            segs,
+            digits,
+            speaker,
+            vid_id,
+            fps,
+            feature_names=feature_names,
+            token_label=token_label,
+            ax_row=axes,
+            fig=fig,
+        )
         fig.tight_layout()
         if args.save:
             fig.savefig(os.path.join(out_dir, f'{args.split}_sample{idx}_overview.png'), dpi=150)
@@ -183,23 +241,36 @@ if __name__ == '__main__':
             plt.show()
         plt.close(fig)
 
-        # Plot 2: Per-digit grid
-        fig2 = plot_digit_segments_grid(segs, digits, speaker, vid_id, fps)
+        # Plot 2: Per-token grid
+        fig2 = plot_token_segments_grid(
+            segs,
+            digits,
+            speaker,
+            vid_id,
+            fps,
+            feature_names=feature_names,
+            token_label=token_label,
+        )
         if args.save:
-            fig2.savefig(os.path.join(out_dir, f'{args.split}_sample{idx}_digits.png'), dpi=150)
-            print(f"  Saved digit grid plot")
+            fig2.savefig(os.path.join(out_dir, f'{args.split}_sample{idx}_tokens.png'), dpi=150)
+            print(f"  Saved token grid plot")
         else:
             plt.show()
         plt.close(fig2)
 
-    # --- Cross-sample digit comparison ---
+    # --- Cross-sample token comparison ---
     if args.digit is not None:
-        print(f"\nComparing digit '{args.digit}' across samples...")
-        fig3 = plot_digit_comparison(data, args.digit)
+        print(f"\nComparing {token_label.lower()} '{args.digit}' across samples...")
+        fig3 = plot_token_comparison(
+            data,
+            args.digit,
+            feature_names=feature_names,
+            token_label=token_label.lower(),
+        )
         if fig3:
             if args.save:
-                fig3.savefig(os.path.join(out_dir, f'{args.split}_digit{args.digit}_compare.png'), dpi=150)
-                print(f"  Saved digit comparison plot")
+                fig3.savefig(os.path.join(out_dir, f'{args.split}_{args.digit}_compare.png'), dpi=150)
+                print(f"  Saved token comparison plot")
             else:
                 plt.show()
             plt.close(fig3)

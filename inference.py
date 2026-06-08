@@ -11,7 +11,6 @@ Usage:
     python inference.py --video path/to/video.mp4 --mode seq2seq --lab path/to/annotation.lab
 """
 import cv2
-import librosa
 import mediapipe as mp_lib
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -104,6 +103,8 @@ def extract_landmarks(video_path, detector):
 def extract_rms_from_video(video_path, num_frames, fps):
     """Extract per-video-frame RMS energy from the audio track of an mp4."""
     try:
+        import librosa
+
         y, sr = librosa.load(video_path, sr=None, mono=True)
         hop_length = max(1, int(sr / fps))
         rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
@@ -367,6 +368,11 @@ if __name__ == '__main__':
                         help='Encoder variant used by the checkpoint')
     parser.add_argument('--face_model', type=str, default=FACE_MODEL_PATH,
                         help=f'Path to face landmarker model (default: {FACE_MODEL_PATH})')
+    parser.add_argument(
+        '--use-audio-rms',
+        action='store_true',
+        help='Append rms_energy from audio to frame features before inference.',
+    )
     args = parser.parse_args()
 
     if args.mode == 'seq2seq':
@@ -415,8 +421,9 @@ if __name__ == '__main__':
     print(f"  {num_frames} frames @ {fps:.1f} FPS")
 
     features = compute_features(all_lm)
-    rms = extract_rms_from_video(args.video, num_frames, fps)
-    features = np.column_stack([features, rms])
+    if args.use_audio_rms:
+        rms = extract_rms_from_video(args.video, num_frames, fps)
+        features = np.column_stack([features, rms])
     print(f"  Features shape: {features.shape}")
 
     # 3. Parse digits and segment

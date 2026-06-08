@@ -96,10 +96,10 @@ def convert_npz_to_csv(npz_path: Path, out_csv: Path) -> None:
 
 
 def main():
-    base = Path("processed_data")
+    base = Path("processed_data/grid")
     for name in ("train", "test"):
         npz = base / f"{name}.npz"
-        out = Path("csv") / f"{name}.csv"
+        out = Path("csv/grid") / f"{name}.csv"
         if not npz.exists():
             print(f"Skipping missing {npz}")
             continue
