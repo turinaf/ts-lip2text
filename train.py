@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import roc_auc_score, roc_curve
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -140,6 +140,19 @@ def _output_dirs(dataset_name, encoder_type):
 
 def _max_sequence_length(dataset):
     return max(len(seq) for seq in dataset.digit_sequences)
+
+
+def _build_digit_balanced_sampler(dataset):
+    """Build inverse-frequency sampler over claimed tokens for digit mode."""
+    claimed_tokens = np.array([int(claimed) for _, claimed, _ in dataset.pairs], dtype=np.int64)
+    counts = np.bincount(claimed_tokens, minlength=dataset.vocab_size).astype(np.float64)
+    counts[counts == 0.0] = 1.0
+    weights = 1.0 / counts[claimed_tokens]
+    return WeightedRandomSampler(
+        weights=torch.DoubleTensor(weights),
+        num_samples=len(weights),
+        replacement=True,
+    )
 
 
 # --- Training ---
@@ -315,6 +328,11 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=N_EPOCHS)
     parser.add_argument('--batch_size', type=int, default=BATCH_SIZE)
     parser.add_argument('--lr', type=float, default=LEARNING_RATE)
+    parser.add_argument(
+        '--no_balanced_sampler',
+        action='store_true',
+        help='Disable claimed-token balanced sampling for digit mode training.',
+    )
     args = parser.parse_args()
 
     print(f'Device: {DEVICE}')
@@ -415,10 +433,18 @@ if __name__ == '__main__':
     elif args.mode == 'seq2seq':
         collate_fn = transcription_collate_fn
 
+    train_sampler = None
+    train_shuffle = True
+    if args.mode == 'digit' and not args.no_balanced_sampler:
+        train_sampler = _build_digit_balanced_sampler(train_ds)
+        train_shuffle = False
+        print('Using claimed-token balanced sampler for digit mode training')
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_shuffle,
+        sampler=train_sampler,
         num_workers=0,
         pin_memory=False,
         collate_fn=collate_fn,

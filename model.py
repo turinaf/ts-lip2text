@@ -191,14 +191,16 @@ class SequenceVerifier(nn.Module):
 
         # Masked mean pooling over digits
         if seq_mask is not None:
-            per_digit_scores = per_digit_scores * seq_mask
-            pooled = per_digit_scores.sum(dim=1, keepdim=True) / seq_mask.sum(dim=1, keepdim=True).clamp(min=1)
+            masked_scores = per_digit_scores * seq_mask
+            pooled = masked_scores.sum(dim=1, keepdim=True) / seq_mask.sum(dim=1, keepdim=True).clamp(min=1)
         else:
+            masked_scores = per_digit_scores
             pooled = per_digit_scores.mean(dim=1, keepdim=True)
 
-        scores_input = per_digit_scores.unsqueeze(-1)  # (B, S, 1)
+        scores_input = masked_scores.unsqueeze(-1)  # (B, S, 1)
         _, h = self.seq_agg(scores_input)                 # h: (1, B, 32)
-        return self.seq_out(h.squeeze(0))
+        # Combine sequence dynamics with masked pooled evidence.
+        return self.seq_out(h.squeeze(0)) + pooled
 
 
 class TinyLipSeq2Seq(nn.Module):

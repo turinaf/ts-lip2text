@@ -9,6 +9,7 @@ from model import CHAR_TO_IDX, N_CLASSES, VOCAB
 MAX_SEQ_LEN = 30
 NEG_RATIO = 1
 EXPECTED_N_DIGITS = 8
+RMS_FEATURE_NAME = 'rms_energy'
 FEATURE_NAME_TO_INDEX = {
     'vertical_aperture': 0,
     'horizontal_spread': 1,
@@ -54,6 +55,20 @@ def _infer_n_features(digit_segments):
     raise ValueError('Could not infer feature dimension from dataset')
 
 
+def _adapt_feature_dim(seg, target_dim):
+    """Slice or zero-pad a segment to the dataset/model feature width."""
+    seg = np.asarray(seg, dtype=np.float32)
+    current_dim = seg.shape[1]
+    if current_dim == target_dim:
+        return seg
+    if current_dim > target_dim:
+        return seg[:, :target_dim]
+
+    padded = np.zeros((seg.shape[0], target_dim), dtype=np.float32)
+    padded[:, :current_dim] = seg
+    return padded
+
+
 def _filter_fixed_length_samples(digit_segments, digit_sequences, expected_len=EXPECTED_N_DIGITS):
     """Keep only samples where both sequence and segment count match expected length."""
     keep_idx = []
@@ -73,6 +88,7 @@ def _prepare_samples(npz_path, dataset='digit', expected_len=EXPECTED_N_DIGITS):
     data = np.load(npz_path, allow_pickle=True)
     digit_segments = data['digit_segments']
     digit_sequences = data['digit_sequences']
+    feature_names = [str(name) for name in data['feature_names'].tolist()] if 'feature_names' in data else None
 
     # Digit dataset is expected to contain fixed-length sequences (default: 8).
     # GRID uses variable-length word sequences, so we keep all samples.
@@ -84,7 +100,7 @@ def _prepare_samples(npz_path, dataset='digit', expected_len=EXPECTED_N_DIGITS):
         )
 
     token_to_idx = _build_token_to_idx(digit_sequences, dataset=dataset)
-    return digit_segments, digit_sequences, token_to_idx
+    return digit_segments, digit_sequences, token_to_idx, feature_names
 
 
 # --- Dataset ---
@@ -98,7 +114,12 @@ class LipVerificationDataset(Dataset):
                  max_seq_len=MAX_SEQ_LEN, neg_ratio=NEG_RATIO, seed=42,
                  expected_len=EXPECTED_N_DIGITS):
         self.dataset = dataset
-        self.digit_segments, self.digit_sequences, inferred_token_to_idx = _prepare_samples(
+        (
+            self.digit_segments,
+            self.digit_sequences,
+            inferred_token_to_idx,
+            self.feature_names,
+        ) = _prepare_samples(
             npz_path,
             dataset=dataset,
             expected_len=expected_len,
@@ -106,7 +127,7 @@ class LipVerificationDataset(Dataset):
         self.token_to_idx = token_to_idx or inferred_token_to_idx
         self.max_seq_len = max_seq_len
         self.rng = np.random.RandomState(seed)
-        self.n_features = _infer_n_features(self.digit_segments)
+        self.n_features = len(self.feature_names) if self.feature_names else _infer_n_features(self.digit_segments)
         self.vocab_size = len(self.token_to_idx)
 
         # Build flat list of (segment_features, char_idx)
@@ -132,10 +153,11 @@ class LipVerificationDataset(Dataset):
     def __getitem__(self, idx):
         seg_idx, claimed, label = self.pairs[idx]
         seg_features, _ = self.segments[seg_idx]
+        seg_features = _adapt_feature_dim(seg_features, self.n_features)
 
         t = seg_features.shape[0]
         if t >= self.max_seq_len:
-            feat = seg_features[:self.max_seq_len]
+            feat = seg_features[:self.max_seq_len].astype(np.float32)
             mask = np.ones(self.max_seq_len, dtype=np.float32)
         else:
             feat = np.zeros((self.max_seq_len, self.n_features), dtype=np.float32)
@@ -159,7 +181,12 @@ class SequenceVerificationDataset(Dataset):
                  max_seg_len=MAX_SEQ_LEN, neg_ratio=NEG_RATIO, seed=42,
                  expected_len=EXPECTED_N_DIGITS):
         self.dataset = dataset
-        self.digit_segments, self.digit_sequences, inferred_token_to_idx = _prepare_samples(
+        (
+            self.digit_segments,
+            self.digit_sequences,
+            inferred_token_to_idx,
+            self.feature_names,
+        ) = _prepare_samples(
             npz_path,
             dataset=dataset,
             expected_len=expected_len,
@@ -168,7 +195,7 @@ class SequenceVerificationDataset(Dataset):
         self.max_seg_len = max_seg_len
         self.rng = np.random.RandomState(seed)
         self.n_videos = len(self.digit_segments)
-        self.n_features = _infer_n_features(self.digit_segments)
+        self.n_features = len(self.feature_names) if self.feature_names else _infer_n_features(self.digit_segments)
         self.vocab_size = len(self.token_to_idx)
 
         self.pairs = []
@@ -195,6 +222,7 @@ class SequenceVerificationDataset(Dataset):
         return len(self.pairs)
 
     def _pad_segment(self, seg):
+        seg = _adapt_feature_dim(seg, self.n_features)
         t = seg.shape[0]
         if t >= self.max_seg_len:
             feat = seg[:self.max_seg_len].astype(np.float32)
@@ -235,20 +263,26 @@ class LipTranscriptionDataset(Dataset):
     def __init__(self, npz_path, dataset='digit', token_to_idx=None,
                  max_seg_len=MAX_SEQ_LEN, expected_len=EXPECTED_N_DIGITS):
         self.dataset = dataset
-        self.digit_segments, self.digit_sequences, inferred_token_to_idx = _prepare_samples(
+        (
+            self.digit_segments,
+            self.digit_sequences,
+            inferred_token_to_idx,
+            self.feature_names,
+        ) = _prepare_samples(
             npz_path,
             dataset=dataset,
             expected_len=expected_len,
         )
         self.token_to_idx = token_to_idx or inferred_token_to_idx
         self.max_seg_len = max_seg_len
-        self.n_features = _infer_n_features(self.digit_segments)
+        self.n_features = len(self.feature_names) if self.feature_names else _infer_n_features(self.digit_segments)
         self.vocab_size = len(self.token_to_idx)
 
     def __len__(self):
         return len(self.digit_segments)
 
     def _pad_segment(self, seg):
+        seg = _adapt_feature_dim(seg, self.n_features)
         t = seg.shape[0]
         if t >= self.max_seg_len:
             feat = seg[:self.max_seg_len].astype(np.float32)

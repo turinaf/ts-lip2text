@@ -25,7 +25,7 @@ DEFAULT_GRID_PROCESSED_ROOT = '../liptev/data/grid'
 DEFAULT_GRID_ORIGINAL_ROOT = '../data'
 DEFAULT_OUTPUT_DIR = 'processed_data'
 
-TEST_SPEAKER_RATIO = 0.1  # ~20% of speakers held out for test
+TEST_SPEAKER_RATIO = 0.121  # 12.1% of speakers held out for test
 RANDOM_SEED = 42
 
 # Lip landmark indices
