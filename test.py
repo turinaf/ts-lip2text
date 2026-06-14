@@ -283,7 +283,7 @@ def print_results(metrics, digit_stats=None):
 # --- Main ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test lip-text verification model')
-    parser.add_argument('--mode', choices=['digit', 'sequence'], default='sequence',
+    parser.add_argument('--mode', choices=['digit', 'sequence'], default='digit',
                         help='digit: per-digit, sequence: full 8-digit')
     parser.add_argument('--encoder', choices=['bigru', 'transformer'], default='transformer',
                         help='Encoder variant used by the checkpoint.')

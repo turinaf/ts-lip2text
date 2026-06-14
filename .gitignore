@@ -6,7 +6,7 @@ data/
 output/
 processed_data/
 runs/
-models/
+results/
 __pycache__/
 plots/
 .vscode/

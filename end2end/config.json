@@ -1,0 +1,16 @@
+{
+    "dataset": "grid",
+    "digit_raw_data_dir": "../digit_data",
+    "digit_processed_data_dir": "./data/digit",
+    "grid_raw_data_dir": "../data",
+    "grid_processed_data_dir": "./data/grid",
+    "use_audio": false,
+    "audio_sample_rate": 16000,
+    "max_frames": 75,
+    "mp_model_path": "face_landmarker.task",
+    "batch_size": 24,
+    "learning_rate": 0.0001,
+    "lip_backbone_pretrained": true,
+    "epochs": 100,
+    "output_dir": "./exp/grid/no_audio"
+}
