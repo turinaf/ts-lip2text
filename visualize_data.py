@@ -33,6 +33,22 @@ def get_feature_names(data, n_features):
     return [prettify_feature_name(n) for n in DEFAULT_FEATURE_NAMES[:n_features]]
 
 
+def get_plot_feature_selection(data, n_features, exclude_names=None):
+    """Return (indices, pretty_names) for features to visualize."""
+    if exclude_names is None:
+        exclude_names = set()
+    exclude_names = {str(n).strip().lower() for n in exclude_names}
+
+    if 'feature_names' in data:
+        raw_names = [str(n) for n in data['feature_names'].tolist()[:n_features]]
+    else:
+        raw_names = DEFAULT_FEATURE_NAMES[:n_features]
+
+    indices = [i for i, name in enumerate(raw_names) if str(name).strip().lower() not in exclude_names]
+    names = [prettify_feature_name(raw_names[i]) for i in indices]
+    return indices, names
+
+
 def plot_sample(
     full_features,
     token_segments,
@@ -124,7 +140,7 @@ def plot_token_segments_grid(token_segments, token_sequence, speaker, video_id, 
     return fig
 
 
-def plot_token_comparison(data, token, feature_names, max_samples=10, token_label='token'):
+def plot_token_comparison(data, token, feature_names, feature_indices=None, max_samples=10, token_label='token'):
     """Compare the same token across different videos/speakers."""
     matches = []
     for i in range(len(data['digit_sequences'])):
@@ -142,6 +158,8 @@ def plot_token_comparison(data, token, feature_names, max_samples=10, token_labe
         return None
 
     n_features = len(feature_names)
+    if feature_indices is None:
+        feature_indices = list(range(n_features))
     fig, axes = plt.subplots(n_features, 1, figsize=(12, 8), sharex=False)
     if n_features == 1:
         axes = np.array([axes])
@@ -152,7 +170,8 @@ def plot_token_comparison(data, token, feature_names, max_samples=10, token_labe
         t = np.arange(len(seg)) / fps
         color = plt.cm.tab10(m_idx / max_samples)
         for f_idx in range(n_features):
-            axes[f_idx].plot(t, seg[:, f_idx], color=color, alpha=0.7, linewidth=1,
+            src_idx = feature_indices[f_idx]
+            axes[f_idx].plot(t, seg[:, src_idx], color=color, alpha=0.7, linewidth=1,
                              label=f'spk {speaker}' if f_idx == 0 else None)
             axes[f_idx].set_ylabel(feature_names[f_idx], fontsize=9)
             axes[f_idx].grid(True, alpha=0.3)
@@ -189,10 +208,22 @@ if __name__ == '__main__':
 
     data = np.load(npz_path, allow_pickle=True)
     n_features = data['full_features'][0].shape[1]
-    feature_names = get_feature_names(data, n_features)
+    feature_indices, feature_names = get_plot_feature_selection(
+        data,
+        n_features,
+        exclude_names={'rms_energy'},
+    )
+    if not feature_indices:
+        print('ERROR: no features left to plot after exclusions.')
+        exit(1)
+
+    plot_n_features = len(feature_names)
     token_label = 'Digit' if args.dataset == 'digit' else 'Token'
     n_videos = len(data['digit_segments'])
-    print(f"Loaded {args.dataset}/{args.split} set: {n_videos} videos ({n_features} features)")
+    print(
+        f"Loaded {args.dataset}/{args.split} set: {n_videos} videos "
+        f"({plot_n_features}/{n_features} features plotted; excluded: rms_energy)"
+    )
 
     out_dir = os.path.join('plots', args.dataset)
     if args.save:
@@ -218,12 +249,15 @@ if __name__ == '__main__':
               f"frames={full_feat.shape[0]}, fps={fps}")
 
         # Plot 1: Full video with token segment overlay
-        fig, axes = plt.subplots(n_features, 1, figsize=(14, max(8, 1.6 * n_features)), sharex=True)
-        if n_features == 1:
+        full_feat_plot = full_feat[:, feature_indices]
+        segs_plot = [seg[:, feature_indices] for seg in segs]
+
+        fig, axes = plt.subplots(plot_n_features, 1, figsize=(14, max(8, 1.6 * plot_n_features)), sharex=True)
+        if plot_n_features == 1:
             axes = np.array([axes])
         plot_sample(
-            full_feat,
-            segs,
+            full_feat_plot,
+            segs_plot,
             digits,
             speaker,
             vid_id,
@@ -243,7 +277,7 @@ if __name__ == '__main__':
 
         # Plot 2: Per-token grid
         fig2 = plot_token_segments_grid(
-            segs,
+            segs_plot,
             digits,
             speaker,
             vid_id,
@@ -265,6 +299,7 @@ if __name__ == '__main__':
             data,
             args.digit,
             feature_names=feature_names,
+            feature_indices=feature_indices,
             token_label=token_label.lower(),
         )
         if fig3:

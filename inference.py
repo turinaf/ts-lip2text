@@ -267,23 +267,30 @@ def segment_by_time(features, alignments, num_frames):
     return segments
 
 
-def segment_by_aperture(features, n_digits, fps, smooth_window=3):
+def segment_by_lip_speed(features, n_digits, fps, smooth_window=3):
     """
     Automatically segment a video into n_digits intervals by detecting
-    local minima in vertical aperture (feature 0) — the mouth closes
-    between digits. Picks the n_digits-1 deepest minima as boundaries.
+    local minima in lip speed (feature 6) — transitions between tokens
+    tend to occur near movement slowdowns. Picks the n_digits-1 lowest
+    minima as boundaries.
     """
     from scipy.signal import savgol_filter, argrelmin
 
-    aperture = features[:, 0]
-    T = len(aperture)
+    if features.shape[1] > 6:
+        lip_speed = features[:, 6]
+    else:
+        vv = np.gradient(features[:, 0])
+        hv = np.gradient(features[:, 2])
+        lip_speed = np.sqrt(vv ** 2 + hv ** 2)
+
+    T = len(lip_speed)
 
     # Smooth to suppress within-digit noise (window must be odd)
     win = smooth_window if smooth_window % 2 == 1 else smooth_window + 1
     win = min(win, T if T % 2 == 1 else T - 1)
-    smoothed = savgol_filter(aperture, window_length=win, polyorder=1) if T > win else aperture
+    smoothed = savgol_filter(lip_speed, window_length=win, polyorder=1) if T > win else lip_speed
 
-    # Find all local minima at order=1 (most sensitive), then pick deepest n_digits-1
+    # Find all local minima at order=1 (most sensitive), then pick lowest n_digits-1
     minima_idx = argrelmin(smoothed, order=1)[0]
 
     if len(minima_idx) >= n_digits - 1:
@@ -568,13 +575,13 @@ if __name__ == '__main__':
                 print('ERROR: seq2seq inference needs --lab or --n_digits to define segmentation length')
                 exit(1)
             n_digits = args.n_digits
-            print(f"  No .lab provided — auto-segmenting by lip aperture minima...")
-            segments = segment_by_aperture(features, n_digits, fps)
+            print(f"  No .lab provided — auto-segmenting by lip speed minima...")
+            segments = segment_by_lip_speed(features, n_digits, fps)
         else:
             tokens = args.digits.strip().split()
             n_digits = len(tokens)
-            print(f"  No .lab provided — auto-segmenting by lip aperture minima...")
-            segments = segment_by_aperture(features, n_digits, fps)
+            print(f"  No .lab provided — auto-segmenting by lip speed minima...")
+            segments = segment_by_lip_speed(features, n_digits, fps)
             print(f"  Tokens: {' '.join(tokens)}")
 
     n_features = infer_input_feature_dim(state_dict)

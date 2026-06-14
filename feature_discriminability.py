@@ -34,7 +34,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else
 # 1. Fisher Discriminant Ratio
 # ---------------------------------------------------------------------------
 
-def fisher_discriminant_ratio(segments_by_digit):
+def fisher_discriminant_ratio(segments_by_digit, n_features=None):
     """
     For each feature, compute FDR = between-class variance / within-class variance.
     segments_by_digit: dict {digit_idx: list of (T, N_FEATURES) arrays}
@@ -49,10 +49,18 @@ def fisher_discriminant_ratio(segments_by_digit):
     for d in all_classes:
         segs = segments_by_digit[d]
         # Summarise each segment by temporal mean only: (N, N_FEATURES)
-        X = np.stack([s.mean(axis=0) for s in segs])   # (N, N_FEATURES)
+        rows = [_segment_to_feature_vector(s, target_dim=n_features) for s in segs]
+        rows = [r for r in rows if r.size > 0]
+        if not rows:
+            continue
+        X = np.stack(rows)   # (N, N_FEATURES)
         class_means[d]  = X.mean(axis=0)
         class_vars[d]   = X.var(axis=0)
         class_counts[d] = len(X)
+
+    all_classes = [d for d in all_classes if d in class_counts]
+    if not all_classes:
+        raise RuntimeError('No valid segments were found to compute Fisher Discriminant Ratio.')
 
     n_total = sum(class_counts.values())
     global_mean = sum(class_counts[d] * class_means[d] for d in all_classes) / n_total
@@ -64,6 +72,33 @@ def fisher_discriminant_ratio(segments_by_digit):
 
     fdr = between / (within + 1e-12)
     return fdr   # (N_FEATURES,)
+
+
+def _adapt_np_feature_dim(x, target_dim):
+    """Slice or zero-pad the last axis of a NumPy array to target_dim."""
+    x = np.asarray(x)
+    current_dim = x.shape[-1]
+    if current_dim == target_dim:
+        return x
+    if current_dim > target_dim:
+        return x[..., :target_dim]
+    pad_shape = list(x.shape)
+    pad_shape[-1] = target_dim - current_dim
+    pad = np.zeros(pad_shape, dtype=x.dtype)
+    return np.concatenate([x, pad], axis=-1)
+
+
+def _segment_to_feature_vector(segment, target_dim=None):
+    """Convert a segment to a 1D feature vector, optionally adapting width."""
+    arr = np.asarray(segment)
+    if arr.ndim == 1:
+        vec = arr
+    else:
+        vec = arr.mean(axis=0)
+    vec = np.asarray(vec).reshape(-1)
+    if target_dim is not None:
+        vec = _adapt_np_feature_dim(vec, target_dim)
+    return vec
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +114,17 @@ def mutual_information(segments_by_digit, n_features):
     X_rows, y_rows = [], []
     for digit, segs in sorted(segments_by_digit.items()):
         for s in segs:
-            row = np.concatenate([s.mean(axis=0), s.std(axis=0)])  # (2*N_FEATURES,)
+            arr = np.asarray(s)
+            if arr.ndim == 1:
+                mean_v = np.asarray(arr).reshape(-1)
+                std_v = np.zeros_like(mean_v)
+            else:
+                mean_v = np.asarray(arr.mean(axis=0)).reshape(-1)
+                std_v = np.asarray(arr.std(axis=0)).reshape(-1)
+
+            mean_v = _adapt_np_feature_dim(mean_v, n_features)
+            std_v = _adapt_np_feature_dim(std_v, n_features)
+            row = np.concatenate([mean_v, std_v])  # (2*N_FEATURES,)
             X_rows.append(row)
             y_rows.append(digit)
 
@@ -395,7 +440,7 @@ if __name__ == '__main__':
     n_segs = sum(len(v) for v in by_digit.values())
     print(f"  {n_segs} digit segments across {n_classes} classes")
 
-    fdr = fisher_discriminant_ratio(by_digit)
+    fdr = fisher_discriminant_ratio(by_digit, n_features=n_features)
     print_ranking(fdr, feature_names, "Fisher Discriminant Ratio (higher = more separable)")
 
     mi = mutual_information(by_digit, n_features)
@@ -495,16 +540,24 @@ if __name__ == '__main__':
 
     plot_dir = os.path.join(args.plot_root, args.dataset)
     saved_paths = []
-    for metric_name, metric_scores in scores_for_plot.items():
-        p = plot_single_metric_bar(
-            feature_names=feature_names,
-            scores=metric_scores,
-            metric_name=metric_name,
-            output_dir=plot_dir,
-            dataset=args.dataset,
-            top_k=args.plot_top_k,
-        )
-        saved_paths.append(p)
+for metric_name, metric_scores in scores_for_plot.items():
+    names_for_plot = feature_names
+    scores_for_plot_this_metric = metric_scores
+
+    if metric_name == 'Fisher Ratio':
+        keep_idx = [i for i, n in enumerate(feature_names) if n != 'rms_energy']
+        names_for_plot = [feature_names[i] for i in keep_idx]
+        scores_for_plot_this_metric = np.asarray(metric_scores)[keep_idx]
+
+    p = plot_single_metric_bar(
+        feature_names=names_for_plot,
+        scores=scores_for_plot_this_metric,
+        metric_name=metric_name,
+        output_dir=plot_dir,
+        dataset=args.dataset,
+        top_k=args.plot_top_k,
+    )
+    saved_paths.append(p)
 
     print("\nSaved publication-style charts:")
     for p in saved_paths:
