@@ -369,6 +369,7 @@ def adapt_feature_dim(features, target_dim):
 
 def infer_input_feature_dim(state_dict):
     for key in (
+        'conv_stack.0.weight',
         'seg_encoder.conv.0.weight',
         'lip_encoder.conv.0.weight',
     ):
