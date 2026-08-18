@@ -12,11 +12,12 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dataset import (
+    FrameLevelTranscriptionDataset,
     LipTranscriptionDataset,
     LipVerificationDataset,
     SequenceVerificationDataset,
 )
-from model import DigitVerifier, SequenceVerifier, TinyLipSeq2Seq
+from model import DigitVerifier, FrameLevelLipSeq2Seq, SequenceVerifier, TinyLipSeq2Seq
 
 # --- Configuration ---
 PROCESSED_ROOT = 'processed_data'
@@ -117,6 +118,42 @@ def transcription_collate_fn(batch):
     )
 
 
+def frame_transcription_collate_fn(batch):
+    """Collate full-utterance frame sequences padded to batch maximum.
+
+    Each batch item is (features (T, F), token_ids (L,), n_tokens).
+    Frames are padded to the max T in the batch, targets to max L + 1 (EOS).
+    """
+    max_frames = max(item[0].shape[0] for item in batch)
+    max_tgt_len = max(item[2] for item in batch) + 1  # tokens + EOS
+    n_features = batch[0][0].shape[1]
+
+    batch_feats = []
+    batch_masks = []
+    batch_targets = []
+
+    for feats, tokens, n_tok in batch:
+        t = feats.shape[0]
+        feat = torch.zeros((max_frames, n_features))
+        feat[:t] = feats
+        mask = torch.zeros(max_frames)
+        mask[:t] = 1.0
+
+        target = torch.full((max_tgt_len,), PAD_IDX, dtype=torch.long)
+        target[:n_tok] = tokens
+        target[n_tok] = EOS_IDX
+
+        batch_feats.append(feat)
+        batch_masks.append(mask)
+        batch_targets.append(target)
+
+    return (
+        torch.stack(batch_feats),
+        torch.stack(batch_masks),
+        torch.stack(batch_targets),
+    )
+
+
 def _dataset_paths(dataset_name):
     processed_dir = os.path.join(PROCESSED_ROOT, dataset_name)
     model_dir = os.path.join(MODEL_ROOT, dataset_name)
@@ -140,6 +177,11 @@ def _output_dirs(dataset_name, encoder_type):
 
 def _max_sequence_length(dataset):
     return max(len(seq) for seq in dataset.digit_sequences)
+
+
+def _max_frames(dataset):
+    """Maximum number of frames across a frame-level transcription dataset."""
+    return max(feat.shape[0] for feat in dataset.full_features)
 
 
 def _build_digit_balanced_sampler(dataset):
@@ -199,6 +241,35 @@ def train_epoch_seq2seq(model, loader, optimizer, criterion, device):
         tgt_in[:, 1:] = targets[:, :-1]
 
         logits = model(segments, masks, src_pad, tgt_in)
+        loss = criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        n_batches += 1
+        pbar.set_postfix(loss=f'{total_loss / n_batches:.4f}')
+
+    return total_loss / max(n_batches, 1)
+
+
+def train_epoch_lipread(model, loader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0.0
+    n_batches = 0
+
+    pbar = tqdm(loader, desc='Train', leave=False)
+    for features, masks, targets in pbar:
+        features = features.to(device)
+        masks = masks.to(device)
+        targets = targets.to(device)
+
+        tgt_in = torch.full_like(targets, PAD_IDX)
+        tgt_in[:, 0] = BOS_IDX
+        tgt_in[:, 1:] = targets[:, :-1]
+
+        logits = model(features, masks, tgt_in)
         loss = criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
 
         optimizer.zero_grad()
@@ -302,6 +373,44 @@ def evaluate_seq2seq(model, loader, device):
     }
 
 
+def evaluate_lipread(model, loader, device):
+    model.eval()
+    total_tokens = 0
+    total_correct_tokens = 0
+    total_seq = 0
+    exact_match = 0
+
+    with torch.no_grad():
+        for features, masks, targets in tqdm(loader, desc='Eval', leave=False):
+            features = features.to(device)
+            masks = masks.to(device)
+            targets = targets.to(device)
+
+            preds = model.greedy_decode(
+                features,
+                masks,
+                bos_idx=BOS_IDX,
+                max_len=targets.shape[1],
+            )
+
+            valid = targets.ne(PAD_IDX)
+            token_correct = (preds == targets) & valid
+            total_correct_tokens += token_correct.sum().item()
+            total_tokens += valid.sum().item()
+
+            for pred_row, tgt_row in zip(preds.cpu().tolist(), targets.cpu().tolist()):
+                total_seq += 1
+                if _strip_special(pred_row) == _strip_special(tgt_row):
+                    exact_match += 1
+
+    return {
+        'token_acc': total_correct_tokens / max(total_tokens, 1),
+        'exact_match_acc': exact_match / max(total_seq, 1),
+        'n_sequences': total_seq,
+        'n_tokens': total_tokens,
+    }
+
+
 # --- Main ---
 if __name__ == '__main__':
     import argparse
@@ -315,9 +424,9 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--mode',
-        choices=['digit', 'sequence', 'seq2seq'],
+        choices=['digit', 'sequence', 'seq2seq', 'lipread'],
         default='sequence',
-        help='digit: per-digit verification, sequence: sequence verification, seq2seq: transcription',
+        help='digit: per-digit verification, sequence: sequence verification, seq2seq: segment-level transcription, lipread: frame-level direct transcription',
     )
     parser.add_argument(
         '--encoder',
@@ -386,7 +495,7 @@ if __name__ == '__main__':
             hidden_dim=HIDDEN_DIM,
             encoder_type=args.encoder,
         ).to(DEVICE)
-    else:
+    elif args.mode == 'seq2seq':
         train_ds = LipTranscriptionDataset(train_path, dataset=args.dataset)
         test_ds = LipTranscriptionDataset(
             test_path,
@@ -415,12 +524,39 @@ if __name__ == '__main__':
             hidden_dim=64,
             encoder_type=args.encoder,
         ).to(DEVICE)
-
-    if args.mode != 'seq2seq':
-        n_classes = train_ds.vocab_size
-        print(f'Vocabulary size: {n_classes}')
     else:
+        train_ds = FrameLevelTranscriptionDataset(train_path, dataset=args.dataset)
+        test_ds = FrameLevelTranscriptionDataset(
+            test_path,
+            dataset=args.dataset,
+            token_to_idx=train_ds.token_to_idx,
+        )
+        n_features = train_ds.n_features
+        n_classes = train_ds.vocab_size
+        seq_len = max(_max_sequence_length(train_ds), _max_sequence_length(test_ds))
+        max_frames = max(_max_frames(train_ds), _max_frames(test_ds))
+        PAD_IDX = n_classes
+        BOS_IDX = n_classes + 1
+        EOS_IDX = n_classes + 2
+        SEQ2SEQ_VOCAB_SIZE = n_classes + 3
+        model = FrameLevelLipSeq2Seq(
+            vocab_size=SEQ2SEQ_VOCAB_SIZE,
+            pad_idx=PAD_IDX,
+            n_features=n_features,
+            d_model=96,
+            n_heads=4,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            ff_dim=192,
+            dropout=0.1,
+            max_src_len=max_frames // 4 + 1,
+            max_tgt_len=seq_len + 1,
+        ).to(DEVICE)
+
+    if args.mode in ('seq2seq', 'lipread'):
         print(f'Vocabulary size: {n_classes} tokens (+3 special tokens)')
+    else:
+        print(f'Vocabulary size: {n_classes}')
 
     vocab_path = os.path.join(model_dir, 'vocab.json')
     with open(vocab_path, 'w') as f:
@@ -432,6 +568,8 @@ if __name__ == '__main__':
         collate_fn = sequence_collate_fn
     elif args.mode == 'seq2seq':
         collate_fn = transcription_collate_fn
+    elif args.mode == 'lipread':
+        collate_fn = frame_transcription_collate_fn
 
     train_sampler = None
     train_shuffle = True
@@ -464,7 +602,7 @@ if __name__ == '__main__':
 
     criterion = (
         nn.CrossEntropyLoss(ignore_index=PAD_IDX)
-        if args.mode == 'seq2seq'
+        if args.mode in ('seq2seq', 'lipread')
         else nn.BCEWithLogitsLoss()
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -476,7 +614,12 @@ if __name__ == '__main__':
 
     best_metric = float('-inf')
     results_log = []
-    model_suffix = 'seq2seq' if args.mode == 'seq2seq' else f'{args.mode}_verifier'
+    if args.mode == 'seq2seq':
+        model_suffix = 'seq2seq'
+    elif args.mode == 'lipread':
+        model_suffix = 'lipread'
+    else:
+        model_suffix = f'{args.mode}_verifier'
     model_save_path = os.path.join(model_dir, f'best_{model_suffix}.pt')
 
     print(f'\nTraining for {args.epochs} epochs...')
@@ -484,6 +627,8 @@ if __name__ == '__main__':
     for epoch in range(1, args.epochs + 1):
         if args.mode == 'seq2seq':
             loss = train_epoch_seq2seq(model, train_loader, optimizer, criterion, DEVICE)
+        elif args.mode == 'lipread':
+            loss = train_epoch_lipread(model, train_loader, optimizer, criterion, DEVICE)
         else:
             loss = train_epoch(model, train_loader, optimizer, criterion, DEVICE)
         scheduler.step()
@@ -492,18 +637,19 @@ if __name__ == '__main__':
         writer.add_scalar('train/lr', scheduler.get_last_lr()[0], epoch)
 
         eval_now = (epoch % 5 == 0 or epoch == args.epochs)
-        if args.mode == 'seq2seq':
+        if args.mode in ('seq2seq', 'lipread'):
             eval_now = True
 
         if eval_now:
-            metrics = (
-                evaluate_seq2seq(model, test_loader, DEVICE)
-                if args.mode == 'seq2seq'
-                else evaluate(model, test_loader, DEVICE)
-            )
+            if args.mode == 'seq2seq':
+                metrics = evaluate_seq2seq(model, test_loader, DEVICE)
+            elif args.mode == 'lipread':
+                metrics = evaluate_lipread(model, test_loader, DEVICE)
+            else:
+                metrics = evaluate(model, test_loader, DEVICE)
             results_log.append({'epoch': epoch, 'loss': loss, **metrics})
 
-            if args.mode == 'seq2seq':
+            if args.mode in ('seq2seq', 'lipread'):
                 writer.add_scalar('eval/token_acc', metrics['token_acc'], epoch)
                 writer.add_scalar('eval/exact_match_acc', metrics['exact_match_acc'], epoch)
                 print(
@@ -533,23 +679,25 @@ if __name__ == '__main__':
     print(f"\n{'=' * 55}")
     print('Final evaluation on test set:')
     model.load_state_dict(torch.load(model_save_path, weights_only=True))
-    final_metrics = (
-        evaluate_seq2seq(model, test_loader, DEVICE)
-        if args.mode == 'seq2seq'
-        else evaluate(model, test_loader, DEVICE)
-    )
+    if args.mode == 'seq2seq':
+        final_metrics = evaluate_seq2seq(model, test_loader, DEVICE)
+    elif args.mode == 'lipread':
+        final_metrics = evaluate_lipread(model, test_loader, DEVICE)
+    else:
+        final_metrics = evaluate(model, test_loader, DEVICE)
     for k, v in final_metrics.items():
         print(f'  {k}: {v:.4f}' if isinstance(v, float) else f'  {k}: {v}')
 
-    if args.mode == 'seq2seq':
+    if args.mode in ('seq2seq', 'lipread'):
         writer.add_hparams(
             {
                 'mode': args.mode,
                 'lr': args.lr,
                 'batch_size': args.batch_size,
                 'epochs': args.epochs,
-                'seg_embed_dim': 48,
-                'hidden_dim': 64,
+                'd_model': 96 if args.mode == 'lipread' else 48,
+                'n_encoder_layers': 2 if args.mode == 'lipread' else 1,
+                'n_decoder_layers': 2 if args.mode == 'lipread' else 1,
             },
             {
                 'hparam/token_acc': final_metrics['token_acc'],
@@ -601,3 +749,22 @@ if __name__ == '__main__':
             default=lambda o: float(o) if isinstance(o, np.floating) else str(o),
         )
     print(f'\nResults saved to {results_path}')
+
+    if args.mode == 'lipread':
+        config = {
+            'vocab_size': SEQ2SEQ_VOCAB_SIZE,
+            'pad_idx': PAD_IDX,
+            'n_features': n_features,
+            'd_model': 96,
+            'n_heads': 4,
+            'n_encoder_layers': 2,
+            'n_decoder_layers': 2,
+            'ff_dim': 192,
+            'dropout': 0.1,
+            'max_src_len': max_frames // 4 + 1,
+            'max_tgt_len': seq_len + 1,
+        }
+        config_path = os.path.join(model_dir, 'lipread_config.json')
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        print(f'Model config saved to {config_path}')

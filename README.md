@@ -3,8 +3,11 @@
 Lip-based digit verification and transcription from time-series facial landmarks.
 The project supports:
 
-- sequence-level verification (`--mode sequence`), this being influenced by highest probability in per digit/word probability. 
+- sequence-level verification (`--mode sequence`), this being influenced by highest probability in per digit/word probability.
 - per-digit (per word) verification (`--mode digit`)
+- segment-level transcription (`--mode seq2seq`)
+- **direct lip reading** (`--mode lipread`): decodes the whole-utterance lip-motion
+  time series straight into text — no negative sampling, no per-digit segmentation.
 
 
 ## Features
@@ -93,14 +96,25 @@ This generates:
 ```bash
 
 python train.py -dataset [digit or grid] --mode digit --encoder [transformer or bigru] --epochs 100
+python train.py -dataset grid --mode lipread --epochs 100
 
 ```
+
+`--mode` selects the task:
+
+- `digit` / `sequence`: verification (requires negative-sample generation).
+- `seq2seq`: segment-level transcription (lip reading over pre-segmented tokens).
+- `lipread`: **frame-level direct lip reading**. The full-utterance lip-motion
+  time series `(T, F)` is fed through a 1D-conv + transformer encoder and decoded
+  autoregressively into tokens. No negative samples, no segmentation.
 
 Training outputs:
 
 - checkpoints in `models/`
 - metrics json in `models/results_<mode>.json`
 - TensorBoard logs in `runs/`
+- for `lipread`, a `lipread_config.json` is saved next to the checkpoint so
+  `test.py` / `inference.py` can reconstruct the model.
 
 Transformer-encoder runs are written under `models/transformer_encoder/` and `runs/transformer_encoder/` 
 
@@ -110,24 +124,29 @@ tensorboard --logdir runs/
 
 ### 3) Evaluate
 
-`test.py` currently supports verification modes (`digit`, `sequence`):
+`test.py` supports verification modes (`digit`, `sequence`) and the `lipread` mode:
 
 ```bash
 python test.py --mode sequence
 python test.py --mode digit
 python test.py --mode sequence --save
+python test.py --mode lipread --dataset grid
 ```
 
 `--save` writes `models/test_results_<mode>.json`.
 
-For `seq2seq`, validation is run inside `train.py` (`token_acc`, `exact_match_acc`), and you can also inspect predictions using `inference.py`.
+For `seq2seq` and `lipread`, validation (`token_acc`, `exact_match_acc`) is run
+inside `train.py`, and you can also inspect predictions using `inference.py`.
 
 ### 4) Inference
 
 ```bash
 python inference.py --dataset grid --video path/to/video.mp4 --lab path/to/file.lab [file.align for grid] --mode digit
-
+python inference.py --dataset grid --video path/to/video.mp4 --mode lipread
 ```
+
+`--mode lipread` decodes the entire video into text directly (no `--digits`,
+`--lab`, or `--n_digits` required).
 
 
 ## Device Support

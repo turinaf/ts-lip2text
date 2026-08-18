@@ -9,6 +9,7 @@ import math
 
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 
 
 # Vocabulary: digits 0-9 plus "!" (alternate pronunciation of 1)
@@ -300,6 +301,161 @@ class TinyLipSeq2Seq(nn.Module):
         memory = self.encode(segments, masks, src_key_padding_mask)
         bsz = segments.shape[0]
         ys = torch.full((bsz, 1), bos_idx, dtype=torch.long, device=segments.device)
+
+        for _ in range(max_len):
+            logits = self.decode(memory, src_key_padding_mask, ys)
+            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            ys = torch.cat([ys, next_token], dim=1)
+
+        return ys[:, 1:]
+
+
+class FrameLevelLipSeq2Seq(nn.Module):
+    """
+    Frame-level encoder-decoder for direct lip reading.
+
+    The whole-utterance lip-motion time series (T, F) is fed through a 1D
+    conv front-end (which downsamples the frame rate by 4x), a transformer
+    encoder over the remaining frames, and an autoregressive transformer
+    decoder that directly predicts the token sequence. There is no per-digit
+    segmentation and no negative-sample generation.
+    """
+
+    def __init__(
+        self,
+        vocab_size,
+        pad_idx,
+        n_features=7,
+        d_model=96,
+        n_heads=4,
+        n_encoder_layers=2,
+        n_decoder_layers=2,
+        ff_dim=192,
+        dropout=0.1,
+        max_src_len=128,
+        max_tgt_len=12,
+        conv_channels=(32, 64),
+    ):
+        super().__init__()
+        self.pad_idx = pad_idx
+        self.max_tgt_len = max_tgt_len
+
+        self.conv_stack = nn.Sequential(
+            nn.Conv1d(n_features, conv_channels[0], kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm1d(conv_channels[0]),
+            nn.ReLU(),
+            nn.Conv1d(conv_channels[0], conv_channels[1], kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm1d(conv_channels[1]),
+            nn.ReLU(),
+            nn.Conv1d(conv_channels[1], conv_channels[1], kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm1d(conv_channels[1]),
+            nn.ReLU(),
+        )
+        self.input_proj = nn.Linear(conv_channels[1], d_model)
+        self.src_pos_emb = nn.Embedding(max_src_len, d_model)
+        self.tgt_tok_emb = nn.Embedding(vocab_size, d_model)
+        self.tgt_pos_emb = nn.Embedding(max_tgt_len, d_model)
+
+        self.transformer = nn.Transformer(
+            d_model=d_model,
+            nhead=n_heads,
+            num_encoder_layers=n_encoder_layers,
+            num_decoder_layers=n_decoder_layers,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            batch_first=True,
+        )
+        # MPS currently lacks the nested-tensor op used by the encoder fast path.
+        # Keep masking behavior but force the regular code path on Apple Silicon.
+        if torch.backends.mps.is_available():
+            self.transformer.encoder.enable_nested_tensor = False
+            self.transformer.encoder.use_nested_tensor = False
+        self.out = nn.Linear(d_model, vocab_size)
+
+    def _downsample_mask(self, mask):
+        """Fold the frame validity mask along the two stride-2 conv reductions."""
+        for _ in range(2):
+            mask = F.max_pool1d(mask.unsqueeze(1), kernel_size=2, stride=2).squeeze(1)
+        return mask
+
+    @staticmethod
+    def _causal_mask(length, device):
+        mask = torch.full((length, length), float('-inf'), device=device)
+        return torch.triu(mask, diagonal=1)
+
+    def encode(self, features, mask):
+        """
+        features: (B, T, F)
+        mask: (B, T) — 1 for valid frames
+        Returns:
+            memory: (B, T', D) frame-level encoder output
+            src_key_padding_mask: (B, T'), True marks padded positions
+        """
+        h = self.conv_stack(features.transpose(1, 2)).transpose(1, 2)  # (B, T', C)
+        src_mask = self._downsample_mask(mask)                          # (B, T'')
+        L = min(h.size(1), src_mask.size(1), self.src_pos_emb.num_embeddings)
+        h = h[:, :L]
+        src_mask = src_mask[:, :L]
+        src_key_padding_mask = src_mask < 0.5                           # True = padded
+
+        h = self.input_proj(h)
+        pos = torch.arange(h.size(1), device=h.device).unsqueeze(0)
+        h = h + self.src_pos_emb(pos)
+
+        # Keep all-padded rows as zero (masked), like LipEncoder._encode_transformer.
+        encoded = torch.zeros_like(h)
+        valid_rows = src_mask.sum(dim=1) > 0
+        if valid_rows.any():
+            encoded_valid = self.transformer.encoder(
+                h[valid_rows],
+                src_key_padding_mask=src_key_padding_mask[valid_rows],
+            )
+            encoded[valid_rows] = encoded_valid
+        return encoded, src_key_padding_mask
+
+    def decode(self, memory, src_key_padding_mask, tgt_in):
+        """
+        memory: (B, T', D)
+        src_key_padding_mask: (B, T')
+        tgt_in: (B, L) shifted target ids
+        """
+        tgt_len = tgt_in.shape[1]
+        tgt_pos = torch.arange(tgt_len, device=tgt_in.device).unsqueeze(0)
+        tgt = self.tgt_tok_emb(tgt_in) * math.sqrt(self.tgt_tok_emb.embedding_dim)
+        tgt = tgt + self.tgt_pos_emb(tgt_pos)
+
+        tgt_mask = self._causal_mask(tgt_len, tgt_in.device)
+        tgt_key_padding_mask = tgt_in.eq(self.pad_idx)
+
+        dec = self.transformer.decoder(
+            tgt,
+            memory,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=src_key_padding_mask,
+        )
+        return self.out(dec)
+
+    def forward(self, features, mask, tgt_in):
+        """
+        features: (B, T, F)
+        mask: (B, T)
+        tgt_in: (B, L)
+        """
+        memory, src_key_padding_mask = self.encode(features, mask)
+        return self.decode(memory, src_key_padding_mask, tgt_in)
+
+    def greedy_decode(self, features, mask, bos_idx, max_len):
+        """
+        Autoregressively decode a token sequence from the full-utterance
+        feature time series.
+        features: (B, T, F)
+        mask: (B, T)
+        Returns: (B, max_len) token ids (no BOS).
+        """
+        memory, src_key_padding_mask = self.encode(features, mask)
+        bsz = features.shape[0]
+        ys = torch.full((bsz, 1), bos_idx, dtype=torch.long, device=features.device)
 
         for _ in range(max_len):
             logits = self.decode(memory, src_key_padding_mask, ys)

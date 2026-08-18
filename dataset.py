@@ -84,6 +84,18 @@ def _filter_fixed_length_samples(digit_segments, digit_sequences, expected_len=E
     return digit_segments[keep_idx], digit_sequences[keep_idx]
 
 
+def _filter_fixed_length_sequences(features, digit_sequences, expected_len=EXPECTED_N_DIGITS):
+    """Keep only samples whose token sequence has the expected length."""
+    keep_idx = [i for i, seq in enumerate(digit_sequences) if len(seq) == expected_len]
+
+    if not keep_idx:
+        raise ValueError(
+            f'No samples with exactly {expected_len} digits found after filtering'
+        )
+
+    return features[keep_idx], digit_sequences[keep_idx]
+
+
 def _prepare_samples(npz_path, dataset='digit', expected_len=EXPECTED_N_DIGITS):
     data = np.load(npz_path, allow_pickle=True)
     digit_segments = data['digit_segments']
@@ -310,6 +322,61 @@ class LipTranscriptionDataset(Dataset):
             torch.FloatTensor(np.array(all_masks)),
             torch.LongTensor(digits),
             n_digits,
+        )
+
+
+class FrameLevelTranscriptionDataset(Dataset):
+    """
+    Frame-level lip reading dataset.
+
+    Each sample is a whole-utterance lip-motion time series together with the
+    token sequence it should be transcribed into:
+        (features (T, F), token_ids (L,), n_tokens)
+
+    Unlike LipTranscriptionDataset, the full `full_features` stream is used
+    directly and no per-token segmentation is required. Frames are padded to
+    the batch maximum by the collate function.
+    """
+
+    def __init__(self, npz_path, dataset='digit', token_to_idx=None,
+                 expected_len=EXPECTED_N_DIGITS):
+        self.dataset = dataset
+        data = np.load(npz_path, allow_pickle=True)
+        self.full_features = data['full_features']
+        self.digit_sequences = data['digit_sequences']
+        feature_names = (
+            [str(name) for name in data['feature_names'].tolist()]
+            if 'feature_names' in data else None
+        )
+
+        # Digit dataset contains fixed-length sequences (default: 8).
+        # GRID uses variable-length word sequences, so all samples are kept.
+        if dataset == 'digit':
+            self.full_features, self.digit_sequences = _filter_fixed_length_sequences(
+                self.full_features,
+                self.digit_sequences,
+                expected_len=expected_len,
+            )
+
+        self.token_to_idx = token_to_idx or _build_token_to_idx(self.digit_sequences, dataset=dataset)
+        self.n_features = (
+            len(feature_names)
+            if feature_names
+            else self.full_features[0].shape[1]
+        )
+        self.vocab_size = len(self.token_to_idx)
+
+    def __len__(self):
+        return len(self.full_features)
+
+    def __getitem__(self, idx):
+        feats = _adapt_feature_dim(self.full_features[idx], self.n_features).astype(np.float32)
+        tokens = _encode_sequence(self.digit_sequences[idx], self.token_to_idx)
+        n_tokens = len(tokens)
+        return (
+            torch.FloatTensor(feats),
+            torch.LongTensor(tokens),
+            n_tokens,
         )
 
 

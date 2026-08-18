@@ -6,11 +6,12 @@ import numpy as np
 import torch
 
 from dataset import (
+    FrameLevelTranscriptionDataset,
     LipTranscriptionDataset,
     LipVerificationDataset,
     SequenceVerificationDataset,
 )
-from model import DigitVerifier, SequenceVerifier, TinyLipSeq2Seq
+from model import DigitVerifier, FrameLevelLipSeq2Seq, SequenceVerifier, TinyLipSeq2Seq
 from preflight import build_model, check_forward_pass, check_npz_file, dataset_paths
 
 
@@ -102,10 +103,73 @@ class PreflightTests(unittest.TestCase):
         digit_model = build_model('digit', 11, 8, 8)
         sequence_model = build_model('sequence', 11, 8, 8)
         seq2seq_model = build_model('seq2seq', 5, 8, 3)
+        lipread_model = build_model('lipread', 11, 8, 8)
 
         self.assertIsInstance(digit_model, DigitVerifier)
         self.assertIsInstance(sequence_model, SequenceVerifier)
         self.assertIsInstance(seq2seq_model, TinyLipSeq2Seq)
+        self.assertIsInstance(lipread_model, FrameLevelLipSeq2Seq)
+
+    def test_frame_level_dataset_uses_full_features(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            npz_path = os.path.join(tmpdir, 'sample.npz')
+            sequences = [['1', '2', '3', '4', '5', '6', '7', '8'],
+                         ['8', '7', '6', '5', '4', '3', '2', '1']]
+            segments = [
+                [_make_segment(5) for _ in range(8)],
+                [_make_segment(6) for _ in range(8)],
+            ]
+            features = [
+                np.concatenate([_make_segment(5) for _ in range(8)], axis=0),
+                np.concatenate([_make_segment(6) for _ in range(8)], axis=0),
+            ]
+            np.savez_compressed(
+                npz_path,
+                digit_segments=np.array(segments, dtype=object),
+                digit_sequences=np.array(sequences, dtype=object),
+                full_features=np.array(features, dtype=object),
+                feature_names=np.array([f'f{i}' for i in range(8)]),
+            )
+
+            ds = FrameLevelTranscriptionDataset(npz_path, dataset='digit')
+            self.assertEqual(len(ds), 2)
+            self.assertEqual(ds.vocab_size, 11)
+            feat, tokens, n_tokens = ds[0]
+            self.assertEqual(feat.shape[1], 8)
+            self.assertEqual(n_tokens, 8)
+            self.assertEqual(list(tokens.shape), [8])
+
+    def test_lipread_forward_pass_is_finite(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            npz_path = os.path.join(tmpdir, 'sample.npz')
+            sequences = [['1', '2', '3', '4', '5', '6', '7', '8']]
+            segments = [[_make_segment(5) for _ in range(8)]]
+            features = [np.concatenate([_make_segment(5) for _ in range(8)], axis=0)]
+            np.savez_compressed(
+                npz_path,
+                digit_segments=np.array(segments, dtype=object),
+                digit_sequences=np.array(sequences, dtype=object),
+                full_features=np.array(features, dtype=object),
+                feature_names=np.array([f'f{i}' for i in range(8)]),
+            )
+
+            check_forward_pass('digit', 'lipread', npz_path)
+
+    def test_lipread_forward_pass_grid_is_finite(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            npz_path = os.path.join(tmpdir, 'sample.npz')
+            sequences = [['BIN', 'BLUE', 'AT', 'F', 'TWO', 'NOW']]
+            segments = [[_make_segment(5) for _ in range(6)]]
+            features = [np.concatenate([_make_segment(5) for _ in range(6)], axis=0)]
+            np.savez_compressed(
+                npz_path,
+                digit_segments=np.array(segments, dtype=object),
+                digit_sequences=np.array(sequences, dtype=object),
+                full_features=np.array(features, dtype=object),
+                feature_names=np.array([f'f{i}' for i in range(8)]),
+            )
+
+            check_forward_pass('grid', 'lipread', npz_path)
 
 
 if __name__ == '__main__':

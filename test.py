@@ -13,8 +13,9 @@ import os
 import json
 import argparse
 
-from model import (DigitVerifier, SequenceVerifier,
+from model import (DigitVerifier, SequenceVerifier, FrameLevelLipSeq2Seq,
                    CHAR_TO_IDX, VOCAB, N_CLASSES)
+from dataset import FrameLevelTranscriptionDataset
 
 # --- Configuration ---
 PROCESSED_DIR = 'processed_data'
@@ -35,6 +36,70 @@ def _default_model_path(mode, encoder_type):
     if encoder_type == 'transformer':
         return os.path.join(MODEL_DIR, 'transformer_encoder', f'best_{mode}_verifier.pt')
     return os.path.join(MODEL_DIR, f'best_{mode}_verifier.pt')
+
+
+def _lipread_collate(batch):
+    """Collate frame-level samples (features, tokens, n_tokens) for lipread."""
+    max_frames = max(item[0].shape[0] for item in batch)
+    max_tgt = max(item[2] for item in batch) + 1  # tokens + EOS
+    n_features = batch[0][0].shape[1]
+
+    batch_feats, batch_masks, batch_targets = [], [], []
+    for feats, tokens, n_tok in batch:
+        t = feats.shape[0]
+        feat = torch.zeros((max_frames, n_features))
+        feat[:t] = feats
+        mask = torch.zeros(max_frames)
+        mask[:t] = 1.0
+        target = torch.full((max_tgt,), PAD_IDX, dtype=torch.long)
+        target[:n_tok] = tokens
+        target[n_tok] = EOS_IDX
+        batch_feats.append(feat)
+        batch_masks.append(mask)
+        batch_targets.append(target)
+
+    return torch.stack(batch_feats), torch.stack(batch_masks), torch.stack(batch_targets)
+
+
+def evaluate_lipread(model, loader, device):
+    """Token accuracy and exact-match accuracy for frame-level transcription."""
+    model.eval()
+    total_tokens, total_correct_tokens, total_seq, exact_match = 0, 0, 0, 0
+
+    with torch.no_grad():
+        for features, masks, targets in tqdm(loader, desc='Testing', leave=False):
+            features = features.to(device)
+            masks = masks.to(device)
+            targets = targets.to(device)
+
+            preds = model.greedy_decode(
+                features, masks, bos_idx=BOS_IDX, max_len=targets.shape[1]
+            )
+            valid = targets.ne(PAD_IDX)
+            token_correct = (preds == targets) & valid
+            total_correct_tokens += token_correct.sum().item()
+            total_tokens += valid.sum().item()
+
+            for pred_row, tgt_row in zip(preds.cpu().tolist(), targets.cpu().tolist()):
+                total_seq += 1
+                if _strip_special(pred_row) == _strip_special(tgt_row):
+                    exact_match += 1
+
+    return {
+        'token_acc': total_correct_tokens / max(total_tokens, 1),
+        'exact_match_acc': exact_match / max(total_seq, 1),
+        'n_sequences': total_seq,
+        'n_tokens': total_tokens,
+    }
+
+
+def _strip_special(tokens):
+    out = []
+    for tok in tokens:
+        if tok == EOS_IDX or tok == PAD_IDX:
+            break
+        out.append(tok)
+    return out
 
 
 # --- Datasets (same as train.py) ---
@@ -282,13 +347,17 @@ def print_results(metrics, digit_stats=None):
 
 # --- Main ---
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Test lip-text verification model')
-    parser.add_argument('--mode', choices=['digit', 'sequence'], default='digit',
-                        help='digit: per-digit, sequence: full 8-digit')
+    parser = argparse.ArgumentParser(description='Test lip-text model')
+    parser.add_argument('--mode', choices=['digit', 'sequence', 'lipread'], default='digit',
+                        help='digit: per-digit, sequence: full 8-digit, lipread: frame-level transcription')
+    parser.add_argument('--dataset', choices=['digit', 'grid'], default='digit',
+                        help='Dataset layout for processed_data and vocabulary (default: digit)')
     parser.add_argument('--encoder', choices=['bigru', 'transformer'], default='transformer',
                         help='Encoder variant used by the checkpoint.')
     parser.add_argument('--model_path', type=str, default=None,
                         help='Path to model checkpoint (default depends on --encoder)')
+    parser.add_argument('--config_path', type=str, default=None,
+                        help='Path to lipread model config JSON')
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--threshold', type=float, default=None,
                         help='Custom decision threshold (default: use EER threshold)')
@@ -296,8 +365,18 @@ if __name__ == '__main__':
                         help='Save detailed results to JSON')
     args = parser.parse_args()
 
-    model_path = args.model_path or _default_model_path(args.mode, args.encoder)
-    test_path = os.path.join(PROCESSED_DIR, 'test.npz')
+    if args.mode == 'lipread':
+        if args.encoder == 'transformer':
+            lipread_dir = os.path.join(MODEL_DIR, 'transformer_encoder')
+        else:
+            lipread_dir = MODEL_DIR
+        model_path = args.model_path or os.path.join(lipread_dir, 'best_lipread.pt')
+        test_path = os.path.join(PROCESSED_DIR, args.dataset, 'test.npz')
+        config_path = args.config_path or os.path.join(lipread_dir, 'lipread_config.json')
+    else:
+        model_path = args.model_path or _default_model_path(args.mode, args.encoder)
+        test_path = os.path.join(PROCESSED_DIR, args.dataset, 'test.npz')
+        config_path = None
 
     if not os.path.exists(test_path):
         print("ERROR: Test data not found. Run preprocess.py first.")
@@ -305,9 +384,12 @@ if __name__ == '__main__':
     if not os.path.exists(model_path):
         print(f"ERROR: Model checkpoint not found at {model_path}. Run train.py first.")
         exit(1)
+    if args.mode == 'lipread' and not os.path.exists(config_path):
+        print(f"ERROR: Lipread model config not found at {config_path}.")
+        exit(1)
 
     print(f"Device: {DEVICE}")
-    print(f"Mode: {args.mode}-level verification")
+    print(f"Mode: {args.mode}")
     print(f"Encoder: {args.encoder}")
     print(f"Model: {model_path}")
 
@@ -316,26 +398,67 @@ if __name__ == '__main__':
         model = DigitVerifier(n_classes=N_CLASSES, embed_dim=EMBED_DIM,
                               n_features=N_FEATURES, hidden_dim=HIDDEN_DIM,
                               encoder_type=args.encoder).to(DEVICE)
-    else:
+    elif args.mode == 'sequence':
         model = SequenceVerifier(n_classes=N_CLASSES, embed_dim=EMBED_DIM,
                                  n_features=N_FEATURES, hidden_dim=HIDDEN_DIM,
                                  encoder_type=args.encoder).to(DEVICE)
+    else:
+        with open(config_path) as f:
+            cfg = json.load(f)
+        model = FrameLevelLipSeq2Seq(
+            vocab_size=cfg['vocab_size'],
+            pad_idx=cfg['pad_idx'],
+            n_features=cfg['n_features'],
+            d_model=cfg['d_model'],
+            n_heads=cfg['n_heads'],
+            n_encoder_layers=cfg['n_encoder_layers'],
+            n_decoder_layers=cfg['n_decoder_layers'],
+            ff_dim=cfg['ff_dim'],
+            dropout=cfg['dropout'],
+            max_src_len=cfg['max_src_len'],
+            max_tgt_len=cfg['max_tgt_len'],
+        ).to(DEVICE)
 
     model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Load test data
-    if args.mode == 'digit':
+    if args.mode == 'lipread':
+        test_ds = FrameLevelTranscriptionDataset(test_path, dataset=args.dataset)
+        PAD_IDX = test_ds.vocab_size
+        BOS_IDX = test_ds.vocab_size + 1
+        EOS_IDX = test_ds.vocab_size + 2
+        collate_fn = _lipread_collate
+    elif args.mode == 'digit':
         test_ds = LipVerificationDataset(test_path)
+        collate_fn = None
     else:
         test_ds = SequenceVerificationDataset(test_path)
+        collate_fn = sequence_collate_fn
 
-    collate_fn = sequence_collate_fn if args.mode == 'sequence' else None
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                              num_workers=0, pin_memory=False, collate_fn=collate_fn)
     print(f"Test samples: {len(test_ds)}")
 
-    # Evaluate
+    if args.mode == 'lipread':
+        metrics = evaluate_lipread(model, test_loader, DEVICE)
+        print(f"\n{'='*60}")
+        print(f"  LIPREAD TEST RESULTS")
+        print(f"{'='*60}")
+        print(f"  Token acc:        {metrics['token_acc']:.4f}")
+        print(f"  Exact match acc:  {metrics['exact_match_acc']:.4f}")
+        print(f"  Sequences:        {metrics['n_sequences']}")
+        print(f"  Tokens:           {metrics['n_tokens']}")
+        print(f"{'='*60}\n")
+
+        if args.save:
+            out_path = os.path.join(MODEL_DIR, 'test_results_lipread.json')
+            with open(out_path, 'w') as f:
+                json.dump({'mode': args.mode, 'model_path': model_path, 'metrics': metrics}, f, indent=2)
+            print(f"Results saved to {out_path}")
+        exit(0)
+
+    # Evaluate (verification modes)
     all_labels, all_probs, preds_eer, preds_05, metrics = evaluate(model, test_loader, DEVICE)
 
     # Use custom threshold if provided

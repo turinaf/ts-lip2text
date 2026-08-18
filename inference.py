@@ -10,6 +10,7 @@ Usage:
     python inference.py --video path/to/video.mp4 --lab path/to/annotation.lab
     python inference.py --video path/to/video.mp4 --digits "1 3 5 7 9 2 4 6" --mode digit
     python inference.py --video path/to/video.mp4 --mode seq2seq --lab path/to/annotation.lab
+    python inference.py --video path/to/video.mp4 --mode lipread
 """
 import cv2
 import mediapipe as mp_lib
@@ -22,7 +23,8 @@ import os
 import json
 
 from model import (DigitVerifier, SequenceVerifier,
-                   TinyLipSeq2Seq, CHAR_TO_IDX, VOCAB, N_CLASSES)
+                   TinyLipSeq2Seq, FrameLevelLipSeq2Seq,
+                   CHAR_TO_IDX, VOCAB, N_CLASSES)
 
 # --- Configuration ---
 FACE_MODEL_PATH = 'data/face_landmarker.task'
@@ -48,13 +50,22 @@ def _dataset_model_dir(dataset, encoder_type):
 
 def _default_model_path(dataset, mode, encoder_type):
     model_dir = _dataset_model_dir(dataset, encoder_type)
-    if mode == 'seq2seq':
-        return os.path.join(model_dir, 'best_seq2seq.pt')
+    if mode in ('seq2seq', 'lipread'):
+        return os.path.join(model_dir, f'best_{mode}.pt')
     return os.path.join(model_dir, f'best_{mode}_verifier.pt')
 
 
 def _default_vocab_path(dataset, encoder_type):
     return os.path.join(_dataset_model_dir(dataset, encoder_type), 'vocab.json')
+
+
+def _default_lipread_config_path(dataset, encoder_type):
+    return os.path.join(_dataset_model_dir(dataset, encoder_type), 'lipread_config.json')
+
+
+def _load_lipread_config(config_path):
+    with open(config_path) as f:
+        return json.load(f)
 
 
 def _load_token_mappings(dataset, vocab_path):
@@ -438,6 +449,28 @@ def infer_seq2seq(model, segments, device, max_len, bos_idx, pad_idx, eos_idx):
     return out
 
 
+def infer_lipread(model, features, device, bos_idx, pad_idx, eos_idx, max_len):
+    """Directly decode the whole-utterance feature time series into token ids."""
+    feats_t = torch.FloatTensor(features).unsqueeze(0).to(device)   # (1, T, F)
+    T = feats_t.size(1)
+    masks_t = torch.ones((1, T), dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        pred_tokens = model.greedy_decode(
+            feats_t,
+            masks_t,
+            bos_idx=bos_idx,
+            max_len=max_len,
+        )[0].cpu().tolist()
+
+    out = []
+    for tok in pred_tokens:
+        if tok == eos_idx or tok == pad_idx:
+            break
+        out.append(tok)
+    return out
+
+
 # --- Main ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Lip-text verification inference')
@@ -449,14 +482,16 @@ if __name__ == '__main__':
                         help='Path to .lab annotation file (contains tokens + time ranges)')
     parser.add_argument('--dataset', choices=['digit', 'grid'], default='digit',
                         help='Dataset-specific vocab/model layout (default: digit)')
-    parser.add_argument('--mode', choices=['digit', 'sequence', 'seq2seq'], default='sequence',
-                        help='Verification mode (default: sequence)')
+    parser.add_argument('--mode', choices=['digit', 'sequence', 'seq2seq', 'lipread'], default='sequence',
+                        help='Verification/transcription mode (default: sequence)')
     parser.add_argument('--n_digits', type=int, default=None,
                         help='Required for seq2seq mode when no .lab is provided')
     parser.add_argument('--model_path', type=str, default=None,
                         help='Path to model checkpoint')
     parser.add_argument('--vocab_path', type=str, default=None,
                         help='Path to vocabulary JSON (defaults to dataset-specific vocab)')
+    parser.add_argument('--lipread_config', type=str, default=None,
+                        help='Path to lipread model config JSON (defaults to dataset-specific config)')
     parser.add_argument('--encoder', choices=['auto', 'bigru', 'transformer'], default='auto',
                         help='Encoder variant used by the checkpoint (default: auto-detect)')
     parser.add_argument('--face_model', type=str, default=FACE_MODEL_PATH,
@@ -479,6 +514,9 @@ if __name__ == '__main__':
         if args.lab is None and args.n_digits is None:
             print('ERROR: seq2seq inference needs --lab or --n_digits to define segmentation length')
             exit(1)
+    elif args.mode == 'lipread':
+        # Direct frame-level decoding: no claimed tokens or segmentation needed.
+        pass
     else:
         if args.lab is None and args.digits is None:
             print('ERROR: verification modes need --digits or --lab')
@@ -565,7 +603,11 @@ if __name__ == '__main__':
 
     # 3. Parse tokens and segment
     tokens = None
-    if args.lab:
+    segments = None
+    if args.mode == 'lipread':
+        # Direct frame-level decoding: use the whole feature time series.
+        print(f"  Using full-utterance features ({features.shape[0]} frames) for direct decoding")
+    elif args.lab:
         tokens, alignments = parse_lab_file(args.lab, fps, dataset=args.dataset, num_frames=num_frames)
         segments = segment_by_time(features, alignments, num_frames)
         print(f"  Tokens from .lab: {' '.join(tokens)}")
@@ -586,8 +628,9 @@ if __name__ == '__main__':
 
     n_features = infer_input_feature_dim(state_dict)
     features = adapt_feature_dim(features, n_features)
-    segments = [adapt_feature_dim(seg, n_features) for seg in segments]
-    n_digits = infer_n_digits_from_segments(segments)
+    if segments is not None:
+        segments = [adapt_feature_dim(seg, n_features) for seg in segments]
+    n_digits = infer_n_digits_from_segments(segments) if segments is not None else num_frames
 
     if tokens is not None:
         for token in tokens:
@@ -605,7 +648,7 @@ if __name__ == '__main__':
         model = SequenceVerifier(n_classes=n_classes, embed_dim=EMBED_DIM,
                                  n_features=n_features, hidden_dim=HIDDEN_DIM,
                                  encoder_type=resolved_encoder).to(DEVICE)
-    else:
+    elif args.mode == 'seq2seq':
         model = TinyLipSeq2Seq(
             vocab_size=seq2seq_vocab_size,
             pad_idx=pad_idx,
@@ -621,6 +664,26 @@ if __name__ == '__main__':
             hidden_dim=64,
             encoder_type=resolved_encoder,
         ).to(DEVICE)
+    else:
+        config_path = args.lipread_config or _default_lipread_config_path(args.dataset, resolved_encoder)
+        if not os.path.exists(config_path):
+            print(f"ERROR: lipread model config not found at {config_path}")
+            exit(1)
+        cfg = _load_lipread_config(config_path)
+        model = FrameLevelLipSeq2Seq(
+            vocab_size=cfg['vocab_size'],
+            pad_idx=cfg['pad_idx'],
+            n_features=n_features,
+            d_model=cfg['d_model'],
+            n_heads=cfg['n_heads'],
+            n_encoder_layers=cfg['n_encoder_layers'],
+            n_decoder_layers=cfg['n_decoder_layers'],
+            ff_dim=cfg['ff_dim'],
+            dropout=cfg['dropout'],
+            max_src_len=cfg['max_src_len'],
+            max_tgt_len=cfg['max_tgt_len'],
+        ).to(DEVICE)
+        print(f"  Loaded lipread config: {config_path}")
 
     model.load_state_dict(state_dict)
     model.eval()
@@ -647,6 +710,20 @@ if __name__ == '__main__':
         )
         pred_tokens = [idx_to_token[i] for i in pred_ids if i in idx_to_token]
         print(f"\n  Predicted tokens: {' '.join(pred_tokens) if pred_tokens else '(empty)'}")
+        if args.lab:
+            print(f"  Ground truth: {' '.join(tokens)}")
+    elif args.mode == 'lipread':
+        pred_ids = infer_lipread(
+            model,
+            features,
+            DEVICE,
+            bos_idx=bos_idx,
+            pad_idx=pad_idx,
+            eos_idx=eos_idx,
+            max_len=model.max_tgt_len,
+        )
+        pred_tokens = [idx_to_token[i] for i in pred_ids if i in idx_to_token]
+        print(f"\n  Transcribed text: {' '.join(pred_tokens) if pred_tokens else '(empty)'}")
         if args.lab:
             print(f"  Ground truth: {' '.join(tokens)}")
     elif args.mode == 'sequence':

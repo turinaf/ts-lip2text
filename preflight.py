@@ -19,11 +19,12 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataset import (
+    FrameLevelTranscriptionDataset,
     LipTranscriptionDataset,
     LipVerificationDataset,
     SequenceVerificationDataset,
 )
-from model import DigitVerifier, SequenceVerifier, TinyLipSeq2Seq
+from model import DigitVerifier, FrameLevelLipSeq2Seq, SequenceVerifier, TinyLipSeq2Seq
 
 
 PROCESSED_ROOT = 'processed_data'
@@ -105,6 +106,12 @@ def build_dataset(dataset_name: str, mode: str, npz_path: str, token_to_idx=None
             token_to_idx=token_to_idx,
             max_seg_len=MAX_SEQ_LEN,
         )
+    if mode == 'lipread':
+        return FrameLevelTranscriptionDataset(
+            npz_path,
+            dataset=dataset_name,
+            token_to_idx=token_to_idx,
+        )
     raise ValueError(f'Unknown mode: {mode}')
 
 
@@ -126,6 +133,21 @@ def build_model(mode: str, vocab_size: int, n_features: int, seq_len: int):
             hidden_dim=HIDDEN_DIM,
         ).to(DEVICE)
 
+    if mode == 'lipread':
+        return FrameLevelLipSeq2Seq(
+            vocab_size=vocab_size + 3,
+            pad_idx=vocab_size,
+            n_features=n_features,
+            d_model=96,
+            n_heads=4,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            ff_dim=192,
+            dropout=0.1,
+            max_src_len=128,
+            max_tgt_len=seq_len + 1,
+        ).to(DEVICE)
+
     pad_idx = vocab_size
     return TinyLipSeq2Seq(
         vocab_size=vocab_size + 3,
@@ -142,13 +164,37 @@ def build_model(mode: str, vocab_size: int, n_features: int, seq_len: int):
         hidden_dim=SEQ2SEQ_HIDDEN_DIM,
     ).to(DEVICE)
 
+def _make_lipread_collate(pad_idx):
+    """Collate variable-length frame features and token targets for lipread."""
+    def collate(batch):
+        max_frames = max(item[0].shape[0] for item in batch)
+        max_tgt = max(item[2] for item in batch) + 1  # tokens + EOS
+        n_features = batch[0][0].shape[1]
+
+        batch_feats, batch_masks, batch_targets = [], [], []
+        for feats, tokens, n_tok in batch:
+            t = feats.shape[0]
+            feat = torch.zeros((max_frames, n_features))
+            feat[:t] = feats
+            mask = torch.zeros(max_frames)
+            mask[:t] = 1.0
+            target = torch.full((max_tgt,), pad_idx, dtype=torch.long)
+            target[:n_tok] = tokens
+            target[n_tok] = pad_idx + 2  # EOS
+            batch_feats.append(feat)
+            batch_masks.append(mask)
+            batch_targets.append(target)
+        return torch.stack(batch_feats), torch.stack(batch_masks), torch.stack(batch_targets)
+    return collate
+
 
 def check_forward_pass(dataset_name: str, mode: str, train_path: str) -> None:
     train_ds = build_dataset(dataset_name, mode, train_path)
     test_ds = build_dataset(dataset_name, mode, train_path, token_to_idx=train_ds.token_to_idx)
     seq_len = max(max_sequence_length(train_ds), max_sequence_length(test_ds))
     model = build_model(mode, train_ds.vocab_size, train_ds.n_features, seq_len)
-    loader = DataLoader(train_ds, batch_size=2, shuffle=False, num_workers=0)
+    collate_fn = _make_lipread_collate(train_ds.vocab_size) if mode == 'lipread' else None
+    loader = DataLoader(train_ds, batch_size=2, shuffle=False, num_workers=0, collate_fn=collate_fn)
 
     batch = next(iter(loader))
     model.eval()
@@ -159,6 +205,12 @@ def check_forward_pass(dataset_name: str, mode: str, train_path: str) -> None:
         elif mode == 'sequence':
             segs, masks, digits, _, seq_mask = [b.to(DEVICE) for b in batch]
             logits = model(segs, masks, digits, seq_mask)
+        elif mode == 'lipread':
+            features, masks, targets = [b.to(DEVICE) for b in batch]
+            tgt_in = torch.full_like(targets, train_ds.vocab_size)
+            tgt_in[:, 0] = train_ds.vocab_size + 1
+            tgt_in[:, 1:] = targets[:, :-1]
+            logits = model(features, masks, tgt_in)
         else:
             segments, masks, src_pad, targets = batch
             segments = segments.to(DEVICE)
@@ -212,7 +264,7 @@ def run_checks(dataset_name: str, mode: str) -> list[CheckResult]:
 def main() -> int:
     parser = argparse.ArgumentParser(description='Preflight checks before training.')
     parser.add_argument('--dataset', choices=['digit', 'grid'], default='digit')
-    parser.add_argument('--mode', choices=['digit', 'sequence', 'seq2seq'], default='sequence')
+    parser.add_argument('--mode', choices=['digit', 'sequence', 'seq2seq', 'lipread'], default='sequence')
     args = parser.parse_args()
 
     results = run_checks(args.dataset, args.mode)
