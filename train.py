@@ -18,6 +18,7 @@ from dataset import (
     SequenceVerificationDataset,
 )
 from model import DigitVerifier, FrameLevelLipSeq2Seq, SequenceVerifier, TinyLipSeq2Seq
+from test import _compute_wer_cer
 
 # --- Configuration ---
 PROCESSED_ROOT = 'processed_data'
@@ -373,12 +374,13 @@ def evaluate_seq2seq(model, loader, device):
     }
 
 
-def evaluate_lipread(model, loader, device):
+def evaluate_lipread(model, loader, device, token_to_idx=None, dataset='digit'):
     model.eval()
     total_tokens = 0
     total_correct_tokens = 0
     total_seq = 0
     exact_match = 0
+    pred_rows, tgt_rows = [], []
 
     with torch.no_grad():
         for features, masks, targets in tqdm(loader, desc='Eval', leave=False):
@@ -402,13 +404,18 @@ def evaluate_lipread(model, loader, device):
                 total_seq += 1
                 if _strip_special(pred_row) == _strip_special(tgt_row):
                     exact_match += 1
+                pred_rows.append(pred_row)
+                tgt_rows.append(tgt_row)
 
-    return {
+    metrics = {
         'token_acc': total_correct_tokens / max(total_tokens, 1),
         'exact_match_acc': exact_match / max(total_seq, 1),
         'n_sequences': total_seq,
         'n_tokens': total_tokens,
     }
+    if token_to_idx is not None:
+        metrics.update(_compute_wer_cer(pred_rows, tgt_rows, token_to_idx, dataset))
+    return metrics
 
 
 # --- Main ---
@@ -644,7 +651,8 @@ if __name__ == '__main__':
             if args.mode == 'seq2seq':
                 metrics = evaluate_seq2seq(model, test_loader, DEVICE)
             elif args.mode == 'lipread':
-                metrics = evaluate_lipread(model, test_loader, DEVICE)
+                metrics = evaluate_lipread(model, test_loader, DEVICE,
+                                           token_to_idx=train_ds.token_to_idx, dataset=args.dataset)
             else:
                 metrics = evaluate(model, test_loader, DEVICE)
             results_log.append({'epoch': epoch, 'loss': loss, **metrics})
@@ -652,11 +660,20 @@ if __name__ == '__main__':
             if args.mode in ('seq2seq', 'lipread'):
                 writer.add_scalar('eval/token_acc', metrics['token_acc'], epoch)
                 writer.add_scalar('eval/exact_match_acc', metrics['exact_match_acc'], epoch)
+                if args.mode == 'lipread':
+                    writer.add_scalar('eval/cer', metrics['cer'], epoch)
+                    if 'wer' in metrics:
+                        writer.add_scalar('eval/wer', metrics['wer'], epoch)
                 print(
                     f"Epoch {epoch:3d} | loss={loss:.4f} | "
                     f"TokenAcc={metrics['token_acc']:.4f} | "
                     f"ExactMatch={metrics['exact_match_acc']:.4f}"
                 )
+                if args.mode == 'lipread':
+                    print(
+                        f"        CER={metrics['cer']:.4f}"
+                        + (f" | WER={metrics['wer']:.4f}" if 'wer' in metrics else "")
+                    )
                 track_metric = metrics['exact_match_acc']
             else:
                 writer.add_scalar('eval/auc', metrics['auc'], epoch)
@@ -682,7 +699,8 @@ if __name__ == '__main__':
     if args.mode == 'seq2seq':
         final_metrics = evaluate_seq2seq(model, test_loader, DEVICE)
     elif args.mode == 'lipread':
-        final_metrics = evaluate_lipread(model, test_loader, DEVICE)
+        final_metrics = evaluate_lipread(model, test_loader, DEVICE,
+                                         token_to_idx=train_ds.token_to_idx, dataset=args.dataset)
     else:
         final_metrics = evaluate(model, test_loader, DEVICE)
     for k, v in final_metrics.items():

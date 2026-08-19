@@ -61,10 +61,11 @@ def _lipread_collate(batch):
     return torch.stack(batch_feats), torch.stack(batch_masks), torch.stack(batch_targets)
 
 
-def evaluate_lipread(model, loader, device):
-    """Token accuracy and exact-match accuracy for frame-level transcription."""
+def evaluate_lipread(model, loader, device, token_to_idx=None, dataset='digit'):
+    """Token accuracy, exact-match accuracy, and WER/CER for frame-level transcription."""
     model.eval()
     total_tokens, total_correct_tokens, total_seq, exact_match = 0, 0, 0, 0
+    pred_rows, tgt_rows = [], []
 
     with torch.no_grad():
         for features, masks, targets in tqdm(loader, desc='Testing', leave=False):
@@ -84,13 +85,18 @@ def evaluate_lipread(model, loader, device):
                 total_seq += 1
                 if _strip_special(pred_row) == _strip_special(tgt_row):
                     exact_match += 1
+                pred_rows.append(pred_row)
+                tgt_rows.append(tgt_row)
 
-    return {
+    metrics = {
         'token_acc': total_correct_tokens / max(total_tokens, 1),
         'exact_match_acc': exact_match / max(total_seq, 1),
         'n_sequences': total_seq,
         'n_tokens': total_tokens,
     }
+    if token_to_idx is not None:
+        metrics.update(_compute_wer_cer(pred_rows, tgt_rows, token_to_idx, dataset))
+    return metrics
 
 
 def _strip_special(tokens):
@@ -100,6 +106,76 @@ def _strip_special(tokens):
             break
         out.append(tok)
     return out
+
+
+def _edit_distance(a, b):
+    """Levenshtein edit distance between two sequences (characters or tokens)."""
+    m, n = len(a), len(b)
+    if m == 0:
+        return n
+    if n == 0:
+        return m
+    prev = list(range(n + 1))
+    for i in range(1, m + 1):
+        cur = [i] + [0] * n
+        for j in range(1, n + 1):
+            cur[j] = min(
+                prev[j] + 1,                                    # deletion
+                cur[j - 1] + 1,                                 # insertion
+                prev[j - 1] + (a[i - 1] != b[j - 1]),           # substitution
+            )
+        prev = cur
+    return prev[n]
+
+
+def _tokens_to_text(tokens, dataset):
+    """Render decoded tokens as text. Digit: raw digit string; GRID: words."""
+    if dataset == 'digit':
+        return ''.join(tokens)
+    return ' '.join(tokens)
+
+
+def _compute_wer_cer(pred_rows, tgt_rows, token_to_idx, dataset='digit'):
+    """
+    Corpus-level WER/CER between predicted and reference token rows.
+
+    CER is always computed; WER is computed for word-level datasets (grid).
+    """
+    idx_to_token = {v: k for k, v in token_to_idx.items()}
+    vocab_size = len(token_to_idx)
+
+    def strip_specials(row):
+        out = []
+        for tok in row:
+            if tok >= vocab_size:
+                break
+            out.append(tok)
+        return out
+
+    cer_edits, cer_ref = 0, 0
+    wer_edits, wer_ref = 0, 0
+
+    for pred_row, tgt_row in zip(pred_rows, tgt_rows):
+        pred_tokens = [idx_to_token[t] for t in strip_specials(pred_row)]
+        ref_tokens = [idx_to_token[t] for t in strip_specials(tgt_row)]
+
+        ref_text = _tokens_to_text(ref_tokens, dataset)
+        pred_text = _tokens_to_text(pred_tokens, dataset)
+        cer_edits += _edit_distance(pred_text, ref_text)
+        cer_ref += len(ref_text)
+
+        if dataset != 'digit':
+            wer_edits += _edit_distance(pred_tokens, ref_tokens)
+            wer_ref += len(ref_tokens)
+
+    metrics = {
+        'cer': cer_edits / max(cer_ref, 1),
+        'n_ref_chars': cer_ref,
+    }
+    if dataset != 'digit':
+        metrics['wer'] = wer_edits / max(wer_ref, 1)
+        metrics['n_ref_words'] = wer_ref
+    return metrics
 
 
 # --- Datasets (same as train.py) ---
@@ -441,12 +517,16 @@ if __name__ == '__main__':
     print(f"Test samples: {len(test_ds)}")
 
     if args.mode == 'lipread':
-        metrics = evaluate_lipread(model, test_loader, DEVICE)
+        metrics = evaluate_lipread(model, test_loader, DEVICE,
+                                   token_to_idx=test_ds.token_to_idx, dataset=args.dataset)
         print(f"\n{'='*60}")
         print(f"  LIPREAD TEST RESULTS")
         print(f"{'='*60}")
         print(f"  Token acc:        {metrics['token_acc']:.4f}")
         print(f"  Exact match acc:  {metrics['exact_match_acc']:.4f}")
+        print(f"  CER:              {metrics['cer']:.4f}")
+        if 'wer' in metrics:
+            print(f"  WER:              {metrics['wer']:.4f}")
         print(f"  Sequences:        {metrics['n_sequences']}")
         print(f"  Tokens:           {metrics['n_tokens']}")
         print(f"{'='*60}\n")

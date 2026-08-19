@@ -13,6 +13,7 @@ from dataset import (
 )
 from model import DigitVerifier, FrameLevelLipSeq2Seq, SequenceVerifier, TinyLipSeq2Seq
 from preflight import build_model, check_forward_pass, check_npz_file, dataset_paths
+from test import _compute_wer_cer, _edit_distance, _tokens_to_text
 
 
 def _make_segment(length: int, feature_dim: int = 8) -> np.ndarray:
@@ -170,6 +171,58 @@ class PreflightTests(unittest.TestCase):
             )
 
             check_forward_pass('grid', 'lipread', npz_path)
+
+
+class WerCerTests(unittest.TestCase):
+    def test_edit_distance_basics(self):
+        self.assertEqual(_edit_distance('', ''), 0)
+        self.assertEqual(_edit_distance('abc', 'abc'), 0)
+        self.assertEqual(_edit_distance('kitten', 'sitting'), 3)
+        self.assertEqual(_edit_distance('abc', 'ab'), 1)
+        self.assertEqual(_edit_distance('ab', 'abc'), 1)
+        self.assertEqual(_edit_distance('abc', 'axc'), 1)
+
+    def test_edit_distance_works_on_token_lists(self):
+        self.assertEqual(_edit_distance(['a', 'b', 'c'], ['a', 'b', 'c']), 0)
+        self.assertEqual(_edit_distance(['a', 'b'], ['a']), 1)
+        self.assertEqual(_edit_distance(['a'], ['a', 'b']), 1)
+
+    def test_tokens_to_text(self):
+        self.assertEqual(_tokens_to_text(['1', '2', '3'], 'digit'), '123')
+        self.assertEqual(_tokens_to_text(['BIN', 'BLUE'], 'grid'), 'BIN BLUE')
+
+    def test_wer_cer_digit_uses_cer_only(self):
+        token_to_idx = {'0': 0, '1': 1, '2': 2}
+        pad, eos = 3, 4
+        pred_rows = [[0, 2, 2, pad, eos]]
+        tgt_rows = [[0, 1, 2, eos]]
+        metrics = _compute_wer_cer(pred_rows, tgt_rows, token_to_idx, 'digit')
+        # "022" vs "012": one substitution, 3 reference chars.
+        self.assertAlmostEqual(metrics['cer'], 1 / 3)
+        self.assertNotIn('wer', metrics)
+
+    def test_wer_cer_grid(self):
+        token_to_idx = {'BIN': 0, 'BLUE': 1, 'AT': 2}
+        # Word order swap: two edits over three reference words -> WER 2/3.
+        metrics = _compute_wer_cer([[0, 2, 1]], [[0, 1, 2]], token_to_idx, 'grid')
+        self.assertAlmostEqual(metrics['wer'], 2 / 3)
+        self.assertIn('cer', metrics)
+
+        # Single-word substitution: WER 1.0, CER 1/3.
+        token_to_idx = {'CAT': 0, 'CAR': 1}
+        metrics = _compute_wer_cer([[1]], [[0]], token_to_idx, 'grid')
+        self.assertAlmostEqual(metrics['wer'], 1.0)
+        self.assertAlmostEqual(metrics['cer'], 1 / 3)
+
+    def test_wer_cer_aggregates_across_rows(self):
+        token_to_idx = {'A': 0, 'B': 1}
+        pred_rows = [[0], [0, 0]]
+        tgt_rows = [[0], [0]]
+        metrics = _compute_wer_cer(pred_rows, tgt_rows, token_to_idx, 'grid')
+        # Insertion of one extra word: total edits 1, ref words 2.
+        self.assertAlmostEqual(metrics['wer'], 0.5)
+        # CER on space-joined text: "A A" vs "A" -> 2 char edits over 2 ref chars.
+        self.assertAlmostEqual(metrics['cer'], 1.0)
 
 
 if __name__ == '__main__':
