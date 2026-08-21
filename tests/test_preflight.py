@@ -11,7 +11,7 @@ from dataset import (
     SequenceVerificationDataset,
 )
 from model import DigitVerifier, SequenceVerifier, TinyLipSeq2Seq
-from preflight import build_model, check_forward_pass, check_npz_file, dataset_paths
+from preflight import build_dataset, build_model, check_forward_pass, check_npz_file, dataset_paths
 
 
 def _make_segment(length: int, feature_dim: int = 8) -> np.ndarray:
@@ -38,10 +38,15 @@ class PreflightTests(unittest.TestCase):
     def test_digit_dataset_keeps_variable_lengths(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             npz_path = os.path.join(tmpdir, 'sample.npz')
-            sequences = [['1'], ['3', '5', '7', '9', '2', '4', '6', '8']]
+            sequences = [
+                ['1', '2', '3', '4', '5', '6', '7', '8'],
+                ['3', '5', '7', '9', '2', '4', '6', '8'],
+            ]
             segments = [
-                [_make_segment(4)],
-                [_make_segment(5), _make_segment(6), _make_segment(7), _make_segment(8), _make_segment(5), _make_segment(4), _make_segment(6), _make_segment(5)],
+                [_make_segment(4), _make_segment(6), _make_segment(5), _make_segment(7),
+                 _make_segment(8), _make_segment(5), _make_segment(4), _make_segment(6)],
+                [_make_segment(5), _make_segment(6), _make_segment(7), _make_segment(8),
+                 _make_segment(5), _make_segment(4), _make_segment(6), _make_segment(5)],
             ]
             _write_npz(npz_path, sequences, segments)
 
@@ -53,7 +58,7 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(len(seq_ds.digit_sequences), 2)
             self.assertEqual(len(trn_ds.digit_sequences), 2)
             self.assertEqual(ds.vocab_size, 11)
-            self.assertEqual(trn_ds[0][0].shape[1:], (30, 8))
+            self.assertEqual(trn_ds[0][0].shape[1:], (16, 8))
 
     def test_grid_dataset_uses_dynamic_vocab(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -89,11 +94,29 @@ class PreflightTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 check_npz_file(npz_path)
 
+    def test_datasets_support_legacy_no_resample(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            npz_path = os.path.join(tmpdir, 'sample.npz')
+            sequences = [['3', '5', '7', '9', '2', '4', '6', '8']]
+            segments = [[_make_segment(5) for _ in range(8)]]
+            _write_npz(npz_path, sequences, segments)
+
+            ds = build_dataset('digit', 'digit', npz_path, resample=False)
+            self.assertEqual(ds[0][0].shape, (30, 8))
+
     def test_forward_pass_digit_mode_is_finite(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             npz_path = os.path.join(tmpdir, 'sample.npz')
-            sequences = [['1'], ['3']]
-            segments = [[_make_segment(4)], [_make_segment(5)]]
+            sequences = [
+                ['1', '2', '3', '4', '5', '6', '7', '8'],
+                ['3', '5', '7', '9', '2', '4', '6', '8'],
+            ]
+            segments = [
+                [_make_segment(4), _make_segment(6), _make_segment(5), _make_segment(7),
+                 _make_segment(8), _make_segment(5), _make_segment(4), _make_segment(6)],
+                [_make_segment(5), _make_segment(6), _make_segment(7), _make_segment(8),
+                 _make_segment(5), _make_segment(4), _make_segment(6), _make_segment(5)],
+            ]
             _write_npz(npz_path, sequences, segments)
 
             check_forward_pass('digit', 'digit', npz_path)

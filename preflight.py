@@ -83,28 +83,16 @@ def check_npz_file(path: str) -> None:
     _assert_finite_array(f'{path}:digit_segments', data['digit_segments'])
 
 
-def build_dataset(dataset_name: str, mode: str, npz_path: str, token_to_idx=None):
+def build_dataset(dataset_name: str, mode: str, npz_path: str, token_to_idx=None,
+                  resample=True, seg_len=16):
+    common = dict(dataset=dataset_name, token_to_idx=token_to_idx,
+                  resample=resample, seg_len=seg_len)
     if mode == 'digit':
-        return LipVerificationDataset(
-            npz_path,
-            dataset=dataset_name,
-            token_to_idx=token_to_idx,
-            max_seq_len=MAX_SEQ_LEN,
-        )
+        return LipVerificationDataset(npz_path, max_seq_len=MAX_SEQ_LEN, **common)
     if mode == 'sequence':
-        return SequenceVerificationDataset(
-            npz_path,
-            dataset=dataset_name,
-            token_to_idx=token_to_idx,
-            max_seg_len=MAX_SEQ_LEN,
-        )
+        return SequenceVerificationDataset(npz_path, max_seg_len=MAX_SEQ_LEN, **common)
     if mode == 'seq2seq':
-        return LipTranscriptionDataset(
-            npz_path,
-            dataset=dataset_name,
-            token_to_idx=token_to_idx,
-            max_seg_len=MAX_SEQ_LEN,
-        )
+        return LipTranscriptionDataset(npz_path, max_seg_len=MAX_SEQ_LEN, **common)
     raise ValueError(f'Unknown mode: {mode}')
 
 

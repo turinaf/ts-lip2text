@@ -4,19 +4,18 @@ from torch.utils.data import Dataset
 import argparse
 
 from model import CHAR_TO_IDX, N_CLASSES, VOCAB
+from transforms import correct_lip_speed_fps, resample_segment, standardize_segment
 
 
 MAX_SEQ_LEN = 30
 NEG_RATIO = 1
 EXPECTED_N_DIGITS = 8
 RMS_FEATURE_NAME = 'rms_energy'
-FEATURE_NAME_TO_INDEX = {
-    'vertical_aperture': 0,
-    'horizontal_spread': 1,
-    'inner_lip_area': 2,
-    'compactness': 3,
-    'lip_speed': 4,
-}
+SEG_LEN = 16
+
+
+def _feature_name_to_index(feature_names):
+    return {name: idx for idx, name in enumerate(feature_names or [])}
 
 
 
@@ -69,7 +68,7 @@ def _adapt_feature_dim(seg, target_dim):
     return padded
 
 
-def _filter_fixed_length_samples(digit_segments, digit_sequences, expected_len=EXPECTED_N_DIGITS):
+def _filter_fixed_length_samples(digit_segments, digit_sequences, fps, expected_len=EXPECTED_N_DIGITS):
     """Keep only samples where both sequence and segment count match expected length."""
     keep_idx = []
     for i, (segs, seq) in enumerate(zip(digit_segments, digit_sequences)):
@@ -81,26 +80,53 @@ def _filter_fixed_length_samples(digit_segments, digit_sequences, expected_len=E
             f'No samples with exactly {expected_len} digits found after filtering'
         )
 
-    return digit_segments[keep_idx], digit_sequences[keep_idx]
+    return digit_segments[keep_idx], digit_sequences[keep_idx], [fps[i] for i in keep_idx]
 
 
-def _prepare_samples(npz_path, dataset='digit', expected_len=EXPECTED_N_DIGITS):
+def _prepare_samples(npz_path, dataset='digit', expected_len=EXPECTED_N_DIGITS, speaker_filter=None):
     data = np.load(npz_path, allow_pickle=True)
     digit_segments = data['digit_segments']
     digit_sequences = data['digit_sequences']
     feature_names = [str(name) for name in data['feature_names'].tolist()] if 'feature_names' in data else None
+    fps = data['fps'].tolist() if 'fps' in data.files else [25.0] * len(digit_segments)
+    speakers = [str(s) for s in data['speakers']] if 'speakers' in data.files else None
+
+    if speaker_filter is not None:
+        if speakers is None:
+            raise ValueError('speaker_filter requested but npz has no speakers array')
+        keep = [i for i, spk in enumerate(speakers) if spk in speaker_filter]
+        digit_segments = digit_segments[keep]
+        digit_sequences = digit_sequences[keep]
+        fps = [fps[i] for i in keep]
 
     # Digit dataset is expected to contain fixed-length sequences (default: 8).
     # GRID uses variable-length word sequences, so we keep all samples.
     if dataset == 'digit':
-        digit_segments, digit_sequences = _filter_fixed_length_samples(
+        digit_segments, digit_sequences, fps = _filter_fixed_length_samples(
             digit_segments,
             digit_sequences,
+            fps,
             expected_len=expected_len,
         )
 
     token_to_idx = _build_token_to_idx(digit_sequences, dataset=dataset)
-    return digit_segments, digit_sequences, token_to_idx, feature_names
+    return {
+        'segments': digit_segments,
+        'sequences': digit_sequences,
+        'token_to_idx': token_to_idx,
+        'feature_names': feature_names,
+        'fps': fps,
+    }
+
+
+def _transform_segment(seg, fps, n_features, resample, seg_len, feature_stats):
+    seg = _adapt_feature_dim(seg, n_features)
+    if resample:
+        seg = correct_lip_speed_fps(seg, fps)
+        seg = resample_segment(seg, seg_len)
+    if feature_stats is not None:
+        seg = standardize_segment(seg, feature_stats['mean'], feature_stats['std'])
+    return seg
 
 
 # --- Dataset ---
@@ -112,36 +138,39 @@ class LipVerificationDataset(Dataset):
 
     def __init__(self, npz_path, dataset='digit', token_to_idx=None,
                  max_seq_len=MAX_SEQ_LEN, neg_ratio=NEG_RATIO, seed=42,
-                 expected_len=EXPECTED_N_DIGITS):
+                 expected_len=EXPECTED_N_DIGITS, resample=True, seg_len=SEG_LEN,
+                 feature_stats=None, speaker_filter=None):
         self.dataset = dataset
-        (
-            self.digit_segments,
-            self.digit_sequences,
-            inferred_token_to_idx,
-            self.feature_names,
-        ) = _prepare_samples(
-            npz_path,
-            dataset=dataset,
-            expected_len=expected_len,
+        prepared = _prepare_samples(
+            npz_path, dataset=dataset, expected_len=expected_len, speaker_filter=speaker_filter,
         )
-        self.token_to_idx = token_to_idx or inferred_token_to_idx
+        self.digit_segments = prepared['segments']
+        self.digit_sequences = prepared['sequences']
+        self.token_to_idx = token_to_idx or prepared['token_to_idx']
+        self.feature_names = prepared['feature_names']
+        self.feature_name_to_index = _feature_name_to_index(self.feature_names)
+        self.fps = prepared['fps']
         self.max_seq_len = max_seq_len
+        self.pad_len = seg_len if resample else max_seq_len
+        self.resample = resample
+        self.seg_len = seg_len
+        self.feature_stats = feature_stats
         self.rng = np.random.RandomState(seed)
         self.n_features = len(self.feature_names) if self.feature_names else _infer_n_features(self.digit_segments)
         self.vocab_size = len(self.token_to_idx)
 
-        # Build flat list of (segment_features, char_idx)
+        # Build flat list of (segment_features, char_idx, fps)
         self.segments = []
         for vid_idx in range(len(self.digit_segments)):
             segs = self.digit_segments[vid_idx]
             digits = self.digit_sequences[vid_idx]
+            video_fps = self.fps[vid_idx]
             for seg, digit in zip(segs, digits):
-                self.segments.append((seg, self.token_to_idx[str(digit)]))
+                self.segments.append((seg, self.token_to_idx[str(digit)], video_fps))
 
-        # Build pairs: positive + negative
         all_indices = list(range(self.vocab_size))
         self.pairs = []
-        for i, (_, cidx) in enumerate(self.segments):
+        for i, (_, cidx, _) in enumerate(self.segments):
             self.pairs.append((i, cidx, 1))
             wrong = [d for d in all_indices if d != cidx]
             for _ in range(neg_ratio):
@@ -152,17 +181,19 @@ class LipVerificationDataset(Dataset):
 
     def __getitem__(self, idx):
         seg_idx, claimed, label = self.pairs[idx]
-        seg_features, _ = self.segments[seg_idx]
-        seg_features = _adapt_feature_dim(seg_features, self.n_features)
+        seg_features, _, fps = self.segments[seg_idx]
+        seg_features = _transform_segment(
+            seg_features, fps, self.n_features, self.resample, self.seg_len, self.feature_stats
+        )
 
         t = seg_features.shape[0]
-        if t >= self.max_seq_len:
-            feat = seg_features[:self.max_seq_len].astype(np.float32)
-            mask = np.ones(self.max_seq_len, dtype=np.float32)
+        if t >= self.pad_len:
+            feat = seg_features[:self.pad_len].astype(np.float32)
+            mask = np.ones(self.pad_len, dtype=np.float32)
         else:
-            feat = np.zeros((self.max_seq_len, self.n_features), dtype=np.float32)
+            feat = np.zeros((self.pad_len, self.n_features), dtype=np.float32)
             feat[:t] = seg_features
-            mask = np.zeros(self.max_seq_len, dtype=np.float32)
+            mask = np.zeros(self.pad_len, dtype=np.float32)
             mask[:t] = 1.0
 
         return (
@@ -172,6 +203,12 @@ class LipVerificationDataset(Dataset):
             torch.FloatTensor([label]),
         )
 
+    def get_pair_info(self, idx):
+        """Return (seg_idx, true_digit, claimed_digit, label) for analysis."""
+        seg_idx, claimed, label = self.pairs[idx]
+        _, true_digit, _ = self.segments[seg_idx]
+        return seg_idx, true_digit, claimed, label
+
 class SequenceVerificationDataset(Dataset):
     """
     Full-sequence verification: verify an entire token sequence at once.
@@ -179,20 +216,23 @@ class SequenceVerificationDataset(Dataset):
 
     def __init__(self, npz_path, dataset='digit', token_to_idx=None,
                  max_seg_len=MAX_SEQ_LEN, neg_ratio=NEG_RATIO, seed=42,
-                 expected_len=EXPECTED_N_DIGITS):
+                 expected_len=EXPECTED_N_DIGITS, resample=True, seg_len=SEG_LEN,
+                 feature_stats=None, speaker_filter=None):
         self.dataset = dataset
-        (
-            self.digit_segments,
-            self.digit_sequences,
-            inferred_token_to_idx,
-            self.feature_names,
-        ) = _prepare_samples(
-            npz_path,
-            dataset=dataset,
-            expected_len=expected_len,
+        prepared = _prepare_samples(
+            npz_path, dataset=dataset, expected_len=expected_len, speaker_filter=speaker_filter,
         )
-        self.token_to_idx = token_to_idx or inferred_token_to_idx
+        self.digit_segments = prepared['segments']
+        self.digit_sequences = prepared['sequences']
+        self.token_to_idx = token_to_idx or prepared['token_to_idx']
+        self.feature_names = prepared['feature_names']
+        self.feature_name_to_index = _feature_name_to_index(self.feature_names)
+        self.fps = prepared['fps']
         self.max_seg_len = max_seg_len
+        self.pad_len = seg_len if resample else max_seg_len
+        self.resample = resample
+        self.seg_len = seg_len
+        self.feature_stats = feature_stats
         self.rng = np.random.RandomState(seed)
         self.n_videos = len(self.digit_segments)
         self.n_features = len(self.feature_names) if self.feature_names else _infer_n_features(self.digit_segments)
@@ -221,16 +261,18 @@ class SequenceVerificationDataset(Dataset):
     def __len__(self):
         return len(self.pairs)
 
-    def _pad_segment(self, seg):
-        seg = _adapt_feature_dim(seg, self.n_features)
+    def _pad_segment(self, seg, fps):
+        seg = _transform_segment(
+            seg, fps, self.n_features, self.resample, self.seg_len, self.feature_stats
+        )
         t = seg.shape[0]
-        if t >= self.max_seg_len:
-            feat = seg[:self.max_seg_len].astype(np.float32)
-            mask = np.ones(self.max_seg_len, dtype=np.float32)
+        if t >= self.pad_len:
+            feat = seg[:self.pad_len].astype(np.float32)
+            mask = np.ones(self.pad_len, dtype=np.float32)
         else:
-            feat = np.zeros((self.max_seg_len, self.n_features), dtype=np.float32)
+            feat = np.zeros((self.pad_len, self.n_features), dtype=np.float32)
             feat[:t] = seg
-            mask = np.zeros(self.max_seg_len, dtype=np.float32)
+            mask = np.zeros(self.pad_len, dtype=np.float32)
             mask[:t] = 1.0
         return feat, mask
 
@@ -239,8 +281,8 @@ class SequenceVerificationDataset(Dataset):
         segments = self.digit_segments[vid_idx]
 
         all_feats, all_masks = [], []
-        for seg in segments:
-            f, m = self._pad_segment(seg)
+        for seg, fps in zip(segments, [self.fps[vid_idx]] * len(segments)):
+            f, m = self._pad_segment(seg, fps)
             all_feats.append(f)
             all_masks.append(m)
 
@@ -261,36 +303,41 @@ class LipTranscriptionDataset(Dataset):
     """
 
     def __init__(self, npz_path, dataset='digit', token_to_idx=None,
-                 max_seg_len=MAX_SEQ_LEN, expected_len=EXPECTED_N_DIGITS):
+                 max_seg_len=MAX_SEQ_LEN, expected_len=EXPECTED_N_DIGITS,
+                 resample=True, seg_len=SEG_LEN, feature_stats=None, speaker_filter=None):
         self.dataset = dataset
-        (
-            self.digit_segments,
-            self.digit_sequences,
-            inferred_token_to_idx,
-            self.feature_names,
-        ) = _prepare_samples(
-            npz_path,
-            dataset=dataset,
-            expected_len=expected_len,
+        prepared = _prepare_samples(
+            npz_path, dataset=dataset, expected_len=expected_len, speaker_filter=speaker_filter,
         )
-        self.token_to_idx = token_to_idx or inferred_token_to_idx
+        self.digit_segments = prepared['segments']
+        self.digit_sequences = prepared['sequences']
+        self.token_to_idx = token_to_idx or prepared['token_to_idx']
+        self.feature_names = prepared['feature_names']
+        self.feature_name_to_index = _feature_name_to_index(self.feature_names)
+        self.fps = prepared['fps']
         self.max_seg_len = max_seg_len
+        self.pad_len = seg_len if resample else max_seg_len
+        self.resample = resample
+        self.seg_len = seg_len
+        self.feature_stats = feature_stats
         self.n_features = len(self.feature_names) if self.feature_names else _infer_n_features(self.digit_segments)
         self.vocab_size = len(self.token_to_idx)
 
     def __len__(self):
         return len(self.digit_segments)
 
-    def _pad_segment(self, seg):
-        seg = _adapt_feature_dim(seg, self.n_features)
+    def _pad_segment(self, seg, fps):
+        seg = _transform_segment(
+            seg, fps, self.n_features, self.resample, self.seg_len, self.feature_stats
+        )
         t = seg.shape[0]
-        if t >= self.max_seg_len:
-            feat = seg[:self.max_seg_len].astype(np.float32)
-            mask = np.ones(self.max_seg_len, dtype=np.float32)
+        if t >= self.pad_len:
+            feat = seg[:self.pad_len].astype(np.float32)
+            mask = np.ones(self.pad_len, dtype=np.float32)
         else:
-            feat = np.zeros((self.max_seg_len, self.n_features), dtype=np.float32)
+            feat = np.zeros((self.pad_len, self.n_features), dtype=np.float32)
             feat[:t] = seg
-            mask = np.zeros(self.max_seg_len, dtype=np.float32)
+            mask = np.zeros(self.pad_len, dtype=np.float32)
             mask[:t] = 1.0
         return feat, mask
 
@@ -299,8 +346,8 @@ class LipTranscriptionDataset(Dataset):
         digits = _encode_sequence(self.digit_sequences[idx], self.token_to_idx)
 
         all_feats, all_masks = [], []
-        for seg in segments:
-            f, m = self._pad_segment(seg)
+        for seg, fps in zip(segments, [self.fps[idx]] * len(segments)):
+            f, m = self._pad_segment(seg, fps)
             all_feats.append(f)
             all_masks.append(m)
 
@@ -311,6 +358,79 @@ class LipTranscriptionDataset(Dataset):
             torch.LongTensor(digits),
             n_digits,
         )
+
+
+def sequence_collate_fn(batch):
+    """Collate sequences with variable number of digits by padding to max in batch."""
+    max_digits = max(item[4] for item in batch)
+    t = batch[0][0].shape[1]
+    f = batch[0][0].shape[2]
+
+    batch_feats = []
+    batch_masks = []
+    batch_digits = []
+    batch_labels = []
+    batch_seq_masks = []
+
+    for feats, masks, digits, label, n_dig in batch:
+        pad_n = max_digits - n_dig
+        if pad_n > 0:
+            feats = torch.cat([feats, torch.zeros(pad_n, t, f)], dim=0)
+            masks = torch.cat([masks, torch.zeros(pad_n, t)], dim=0)
+            digits = torch.cat([digits, torch.zeros(pad_n, dtype=torch.long)], dim=0)
+        seq_mask = torch.zeros(max_digits)
+        seq_mask[:n_dig] = 1.0
+        batch_feats.append(feats)
+        batch_masks.append(masks)
+        batch_digits.append(digits)
+        batch_labels.append(label)
+        batch_seq_masks.append(seq_mask)
+
+    return (
+        torch.stack(batch_feats),
+        torch.stack(batch_masks),
+        torch.stack(batch_digits),
+        torch.stack(batch_labels),
+        torch.stack(batch_seq_masks),
+    )
+
+
+def transcription_collate_fn(batch, pad_idx, eos_idx):
+    """Pad variable-length segment and token sequences for seq2seq training."""
+    max_digits = max(item[3] for item in batch)
+    t = batch[0][0].shape[1]
+    f = batch[0][0].shape[2]
+    max_tgt_len = max_digits + 1  # digits + EOS
+
+    batch_feats = []
+    batch_masks = []
+    batch_src_pad = []
+    batch_targets = []
+
+    for feats, masks, digits, n_dig in batch:
+        pad_n = max_digits - n_dig
+        if pad_n > 0:
+            feats = torch.cat([feats, torch.zeros(pad_n, t, f)], dim=0)
+            masks = torch.cat([masks, torch.zeros(pad_n, t)], dim=0)
+
+        src_pad = torch.ones(max_digits, dtype=torch.bool)
+        src_pad[:n_dig] = False
+
+        target = torch.full((max_tgt_len,), pad_idx, dtype=torch.long)
+        target[:n_dig] = digits
+        target[n_dig] = eos_idx
+
+        batch_feats.append(feats)
+        batch_masks.append(masks)
+        batch_src_pad.append(src_pad)
+        batch_targets.append(target)
+
+    return (
+        torch.stack(batch_feats),
+        torch.stack(batch_masks),
+        torch.stack(batch_src_pad),
+        torch.stack(batch_targets),
+    )
 
 
 def _print_sample_summary(ds, sample_idx, dataset_name, feature_name='lip_speed'):
@@ -324,7 +444,7 @@ def _print_sample_summary(ds, sample_idx, dataset_name, feature_name='lip_speed'
     print(f'- features_shape={tuple(feats.shape)}')
     print(f'- masks_shape={tuple(masks.shape)}')
 
-    feature_idx = FEATURE_NAME_TO_INDEX[feature_name]
+    feature_idx = ds.feature_name_to_index[feature_name]
     feature_values = []
     for token_idx in range(n_tokens):
         valid_len = int(masks[token_idx].sum().item())
@@ -348,7 +468,6 @@ def _parse_args():
     parser.add_argument('--max-seg-len', type=int, default=MAX_SEQ_LEN, help='Max frames per segment for padding/truncation.')
     parser.add_argument(
         '--feature-name',
-        choices=list(FEATURE_NAME_TO_INDEX.keys()),
         default='lip_speed',
         help='Feature trajectory to print across the full video.',
     )
@@ -368,6 +487,11 @@ if __name__ == '__main__':
         dataset=args.dataset,
         max_seg_len=args.max_seg_len,
     )
+
+    if args.feature_name not in ds.feature_name_to_index:
+        raise SystemExit(
+            f"Unknown feature '{args.feature_name}'. Available: {sorted(ds.feature_name_to_index)}"
+        )
 
     print(f'Dataset loaded from: {npz_path}')
     print(f'- dataset={args.dataset}')
