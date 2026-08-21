@@ -2,6 +2,7 @@
 import json
 import os
 import time
+from functools import partial
 
 import numpy as np
 import torch
@@ -12,11 +13,16 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dataset import (
+    SEG_LEN,
     LipTranscriptionDataset,
     LipVerificationDataset,
     SequenceVerificationDataset,
+    compute_split_stats,
+    sequence_collate_fn,
+    transcription_collate_fn,
 )
-from model import DigitVerifier, SequenceVerifier, TinyLipSeq2Seq
+from transforms import load_feature_stats, save_feature_stats
+import checkpoint as ckpt
 
 # --- Configuration ---
 PROCESSED_ROOT = 'processed_data'
@@ -44,98 +50,23 @@ EOS_IDX = None
 SEQ2SEQ_VOCAB_SIZE = None
 
 
-def sequence_collate_fn(batch):
-    """Collate sequences with variable number of digits by padding to max in batch."""
-    max_digits = max(item[4] for item in batch)
-    t = batch[0][0].shape[1]
-    f = batch[0][0].shape[2]
-
-    batch_feats = []
-    batch_masks = []
-    batch_digits = []
-    batch_labels = []
-    batch_seq_masks = []
-
-    for feats, masks, digits, label, n_dig in batch:
-        pad_n = max_digits - n_dig
-        if pad_n > 0:
-            feats = torch.cat([feats, torch.zeros(pad_n, t, f)], dim=0)
-            masks = torch.cat([masks, torch.zeros(pad_n, t)], dim=0)
-            digits = torch.cat([digits, torch.zeros(pad_n, dtype=torch.long)], dim=0)
-        seq_mask = torch.zeros(max_digits)
-        seq_mask[:n_dig] = 1.0
-        batch_feats.append(feats)
-        batch_masks.append(masks)
-        batch_digits.append(digits)
-        batch_labels.append(label)
-        batch_seq_masks.append(seq_mask)
-
-    return (
-        torch.stack(batch_feats),
-        torch.stack(batch_masks),
-        torch.stack(batch_digits),
-        torch.stack(batch_labels),
-        torch.stack(batch_seq_masks),
-    )
-
-
-def transcription_collate_fn(batch):
-    """Pad variable-length segment and token sequences for seq2seq training."""
-    max_digits = max(item[3] for item in batch)
-    t = batch[0][0].shape[1]
-    f = batch[0][0].shape[2]
-    max_tgt_len = max_digits + 1  # digits + EOS
-
-    batch_feats = []
-    batch_masks = []
-    batch_src_pad = []
-    batch_targets = []
-
-    for feats, masks, digits, n_dig in batch:
-        pad_n = max_digits - n_dig
-        if pad_n > 0:
-            feats = torch.cat([feats, torch.zeros(pad_n, t, f)], dim=0)
-            masks = torch.cat([masks, torch.zeros(pad_n, t)], dim=0)
-
-        src_pad = torch.ones(max_digits, dtype=torch.bool)
-        src_pad[:n_dig] = False
-
-        target = torch.full((max_tgt_len,), PAD_IDX, dtype=torch.long)
-        target[:n_dig] = digits
-        target[n_dig] = EOS_IDX
-
-        batch_feats.append(feats)
-        batch_masks.append(masks)
-        batch_src_pad.append(src_pad)
-        batch_targets.append(target)
-
-    return (
-        torch.stack(batch_feats),
-        torch.stack(batch_masks),
-        torch.stack(batch_src_pad),
-        torch.stack(batch_targets),
-    )
-
-
-def _dataset_paths(dataset_name):
-    processed_dir = os.path.join(PROCESSED_ROOT, dataset_name)
-    model_dir = os.path.join(MODEL_ROOT, dataset_name)
-    log_dir = os.path.join(LOG_ROOT, dataset_name)
+def _resolve_dirs(args):
+    processed_dir = os.path.join(args.data_dir, args.dataset)
+    model_dir = os.path.join(args.model_root, args.dataset, args.encoder)
+    log_dir = os.path.join(args.log_root, args.dataset, args.encoder)
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
     return processed_dir, model_dir, log_dir
 
 
-def _output_dirs(dataset_name, encoder_type):
-    if encoder_type == 'transformer':
-        model_dir = os.path.join(MODEL_ROOT, 'transformer_encoder')
-        log_dir = os.path.join(LOG_ROOT, 'transformer_encoder')
-    else:
-        model_dir = os.path.join(MODEL_ROOT, dataset_name)
-        log_dir = os.path.join(LOG_ROOT, dataset_name)
-    os.makedirs(model_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
-    return model_dir, log_dir
+def _speaker_split(train_path):
+    """Deterministic speaker-level split: every 10th sorted speaker -> val."""
+    data = np.load(train_path, allow_pickle=True)
+    if 'speakers' not in data.files:
+        return None, set()
+    speakers = sorted({str(s) for s in data['speakers']})
+    val = set(speakers[::10])
+    return set(speakers) - val, val
 
 
 def _max_sequence_length(dataset):
@@ -328,6 +259,16 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=N_EPOCHS)
     parser.add_argument('--batch_size', type=int, default=BATCH_SIZE)
     parser.add_argument('--lr', type=float, default=LEARNING_RATE)
+    parser.add_argument('--seg-len', type=int, default=SEG_LEN,
+                        help='Fixed frame length for resampled segments.')
+    parser.add_argument('--no-resample', action='store_true',
+                        help='Disable fps-corrected fixed-length resampling (legacy pad-to-30 path).')
+    parser.add_argument('--no-standardize', action='store_true',
+                        help='Disable per-feature standardization with train-split stats.')
+    parser.add_argument('--data-dir', default=PROCESSED_ROOT,
+                        help='Root containing <dataset>/train.npz and test.npz.')
+    parser.add_argument('--model-root', default=MODEL_ROOT, help='Root for checkpoints/configs.')
+    parser.add_argument('--log-root', default=LOG_ROOT, help='Root for TensorBoard logs.')
     parser.add_argument(
         '--no_balanced_sampler',
         action='store_true',
@@ -336,8 +277,10 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     print(f'Device: {DEVICE}')
-    processed_dir, model_dir, log_dir = _dataset_paths(args.dataset)
-    model_dir, log_dir = _output_dirs(args.dataset, args.encoder)
+    use_resample = not args.no_resample
+    use_standardize = not args.no_standardize
+
+    processed_dir, model_dir, log_dir = _resolve_dirs(args)
     train_path = os.path.join(processed_dir, 'train.npz')
     test_path = os.path.join(processed_dir, 'test.npz')
 
@@ -345,75 +288,104 @@ if __name__ == '__main__':
         print('ERROR: Preprocessed data not found. Run preprocess.py first.')
         raise SystemExit(1)
 
+    train_speakers, val_speakers = _speaker_split(train_path)
+    if not val_speakers:
+        print('WARNING: no speakers array in npz; best checkpoint selected on TEST (legacy behavior)')
+
+    feature_stats = None
+    if use_standardize:
+        stats_path = os.path.join(processed_dir, 'feature_stats.json')
+        if os.path.exists(stats_path):
+            feature_stats = load_feature_stats(stats_path)
+            print(f'Loaded feature stats from {stats_path}')
+        else:
+            print('Computing train-split feature stats...')
+            raw_stats = compute_split_stats(
+                train_path, dataset=args.dataset,
+                resample=use_resample, seg_len=args.seg_len,
+                speaker_filter=train_speakers,
+            )
+            with np.load(train_path, allow_pickle=True) as data:
+                feature_names = (
+                    [str(n) for n in data['feature_names'].tolist()]
+                    if 'feature_names' in data.files
+                    else [f'f{i}' for i in range(len(raw_stats['mean']))]
+                )
+            feature_stats = raw_stats
+            save_feature_stats(stats_path, raw_stats, feature_names)
+            print(f'Saved feature stats to {stats_path}')
+
     print(f'\nDataset: {args.dataset}')
     print(f'Mode: {args.mode}')
     print(f'Encoder: {args.encoder}')
+    print(f'Resample: {use_resample} (seg_len={args.seg_len}) | Standardize: {use_standardize}')
     print('Loading data...')
 
+    common = dict(dataset=args.dataset, resample=use_resample,
+                  seg_len=args.seg_len, feature_stats=feature_stats)
+
     if args.mode == 'digit':
-        train_ds = LipVerificationDataset(train_path, dataset=args.dataset)
-        test_ds = LipVerificationDataset(
-            test_path,
-            dataset=args.dataset,
-            token_to_idx=train_ds.token_to_idx,
-            seed=99,
+        train_ds = LipVerificationDataset(train_path, speaker_filter=train_speakers, **common)
+        val_ds = (
+            LipVerificationDataset(train_path, token_to_idx=train_ds.token_to_idx,
+                                   seed=99, speaker_filter=val_speakers, **common)
+            if val_speakers else None
         )
-        n_features = train_ds.n_features
-        n_classes = train_ds.vocab_size
-        model = DigitVerifier(
-            n_classes=n_classes,
-            embed_dim=EMBED_DIM,
-            n_features=n_features,
-            hidden_dim=HIDDEN_DIM,
-            encoder_type=args.encoder,
-        ).to(DEVICE)
+        test_ds = LipVerificationDataset(test_path, token_to_idx=train_ds.token_to_idx,
+                                         seed=99, **common)
     elif args.mode == 'sequence':
-        train_ds = SequenceVerificationDataset(train_path, dataset=args.dataset)
-        test_ds = SequenceVerificationDataset(
-            test_path,
-            dataset=args.dataset,
-            token_to_idx=train_ds.token_to_idx,
-            seed=99,
+        train_ds = SequenceVerificationDataset(train_path, speaker_filter=train_speakers, **common)
+        val_ds = (
+            SequenceVerificationDataset(train_path, token_to_idx=train_ds.token_to_idx,
+                                        seed=99, speaker_filter=val_speakers, **common)
+            if val_speakers else None
         )
-        n_features = train_ds.n_features
-        n_classes = train_ds.vocab_size
-        seq_len = max(_max_sequence_length(train_ds), _max_sequence_length(test_ds))
-        model = SequenceVerifier(
-            n_classes=n_classes,
-            embed_dim=EMBED_DIM,
-            n_features=n_features,
-            hidden_dim=HIDDEN_DIM,
-            encoder_type=args.encoder,
-        ).to(DEVICE)
+        test_ds = SequenceVerificationDataset(test_path, token_to_idx=train_ds.token_to_idx,
+                                              seed=99, **common)
     else:
-        train_ds = LipTranscriptionDataset(train_path, dataset=args.dataset)
-        test_ds = LipTranscriptionDataset(
-            test_path,
-            dataset=args.dataset,
-            token_to_idx=train_ds.token_to_idx,
+        train_ds = LipTranscriptionDataset(train_path, speaker_filter=train_speakers, **common)
+        val_ds = (
+            LipTranscriptionDataset(train_path, token_to_idx=train_ds.token_to_idx,
+                                    speaker_filter=val_speakers, **common)
+            if val_speakers else None
         )
-        n_features = train_ds.n_features
-        n_classes = train_ds.vocab_size
+        test_ds = LipTranscriptionDataset(test_path, token_to_idx=train_ds.token_to_idx, **common)
+
+    n_features = train_ds.n_features
+    n_classes = train_ds.vocab_size
+
+    if args.mode == 'seq2seq':
         seq_len = max(_max_sequence_length(train_ds), _max_sequence_length(test_ds))
         PAD_IDX = n_classes
         BOS_IDX = n_classes + 1
         EOS_IDX = n_classes + 2
         SEQ2SEQ_VOCAB_SIZE = n_classes + 3
-        model = TinyLipSeq2Seq(
-            vocab_size=SEQ2SEQ_VOCAB_SIZE,
-            pad_idx=PAD_IDX,
-            n_features=n_features,
-            seg_embed_dim=48,
-            n_heads=4,
-            n_encoder_layers=1,
-            n_decoder_layers=1,
-            ff_dim=128,
-            dropout=0.1,
-            max_src_len=seq_len,
-            max_tgt_len=seq_len + 1,
-            hidden_dim=64,
-            encoder_type=args.encoder,
-        ).to(DEVICE)
+        model_kwargs = {
+            'vocab_size': SEQ2SEQ_VOCAB_SIZE, 'pad_idx': PAD_IDX, 'n_features': n_features,
+            'seg_embed_dim': 48, 'n_heads': 4, 'n_encoder_layers': 1, 'n_decoder_layers': 1,
+            'ff_dim': 128, 'dropout': 0.1, 'max_src_len': seq_len, 'max_tgt_len': seq_len + 1,
+            'hidden_dim': 64, 'encoder_type': args.encoder,
+        }
+    else:
+        model_kwargs = {
+            'n_classes': n_classes, 'embed_dim': EMBED_DIM, 'n_features': n_features,
+            'hidden_dim': HIDDEN_DIM, 'encoder_type': args.encoder,
+        }
+
+    config = {
+        'config_version': 1,
+        'dataset': args.dataset,
+        'mode': args.mode,
+        'encoder_type': args.encoder,
+        'n_features': n_features,
+        'feature_names': train_ds.feature_names,
+        'seg_len': args.seg_len,
+        'resample': use_resample,
+        'standardized': feature_stats is not None,
+        'vocab_size': n_classes,
+        'model': model_kwargs,
+    }
+    model = ckpt.build_model_from_config(config, DEVICE)
 
     if args.mode != 'seq2seq':
         n_classes = train_ds.vocab_size
@@ -426,12 +398,17 @@ if __name__ == '__main__':
         json.dump(train_ds.token_to_idx, f, indent=2)
     print(f'Vocabulary saved to {vocab_path}')
 
+    config_path = ckpt.save_model_config(model_dir, config, filename=f'config_{args.mode}.json')
+    print(f'Model config saved to {config_path}')
+
     collate_fn = None
     if args.mode == 'sequence':
         collate_fn = sequence_collate_fn
     elif args.mode == 'seq2seq':
-        collate_fn = transcription_collate_fn
+        collate_fn = partial(transcription_collate_fn, pad_idx=PAD_IDX, eos_idx=EOS_IDX)
 
+    loader_kwargs = dict(batch_size=args.batch_size, num_workers=0, pin_memory=False,
+                         collate_fn=collate_fn)
     train_sampler = None
     train_shuffle = True
     if args.mode == 'digit' and not args.no_balanced_sampler:
@@ -439,25 +416,14 @@ if __name__ == '__main__':
         train_shuffle = False
         print('Using claimed-token balanced sampler for digit mode training')
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=train_shuffle,
-        sampler=train_sampler,
-        num_workers=0,
-        pin_memory=False,
-        collate_fn=collate_fn,
+    train_loader = DataLoader(train_ds, shuffle=train_shuffle, sampler=train_sampler, **loader_kwargs)
+    val_loader = (
+        DataLoader(val_ds, shuffle=False, **loader_kwargs) if val_ds is not None else None
     )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-        collate_fn=collate_fn,
-    )
+    test_loader = DataLoader(test_ds, shuffle=False, **loader_kwargs)
 
-    print(f'Train: {len(train_ds)} samples, Test: {len(test_ds)} samples')
+    print(f'Train: {len(train_ds)} samples, Val: {len(val_ds) if val_ds else 0} samples, '
+          f'Test: {len(test_ds)} samples')
     print(f'Feature dim: {n_features}')
     print(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')
 
@@ -478,6 +444,10 @@ if __name__ == '__main__':
     model_suffix = 'seq2seq' if args.mode == 'seq2seq' else f'{args.mode}_verifier'
     model_save_path = os.path.join(model_dir, f'best_{model_suffix}.pt')
 
+    selection_loader = val_loader if val_loader is not None else test_loader
+    selection_name = 'val' if val_loader is not None else 'test'
+    print(f'Best-checkpoint selection on: {selection_name}')
+
     print(f'\nTraining for {args.epochs} epochs...')
 
     for epoch in range(1, args.epochs + 1):
@@ -496,9 +466,9 @@ if __name__ == '__main__':
 
         if eval_now:
             metrics = (
-                evaluate_seq2seq(model, test_loader, DEVICE)
+                evaluate_seq2seq(model, selection_loader, DEVICE)
                 if args.mode == 'seq2seq'
-                else evaluate(model, test_loader, DEVICE)
+                else evaluate(model, selection_loader, DEVICE)
             )
             results_log.append({'epoch': epoch, 'loss': loss, **metrics})
 
@@ -507,7 +477,7 @@ if __name__ == '__main__':
                 writer.add_scalar('eval/exact_match_acc', metrics['exact_match_acc'], epoch)
                 print(
                     f"Epoch {epoch:3d} | loss={loss:.4f} | "
-                    f"TokenAcc={metrics['token_acc']:.4f} | "
+                    f"{selection_name} TokenAcc={metrics['token_acc']:.4f} | "
                     f"ExactMatch={metrics['exact_match_acc']:.4f}"
                 )
                 track_metric = metrics['exact_match_acc']
@@ -517,7 +487,7 @@ if __name__ == '__main__':
                 writer.add_scalar('eval/acc_at_eer', metrics['acc_at_eer'], epoch)
                 writer.add_scalar('eval/acc_at_05', metrics['acc_at_05'], epoch)
                 print(
-                    f"Epoch {epoch:3d} | loss={loss:.4f} | AUC={metrics['auc']:.4f} | "
+                    f"Epoch {epoch:3d} | loss={loss:.4f} | {selection_name} AUC={metrics['auc']:.4f} | "
                     f"EER={metrics['eer']:.4f} | Acc@EER={metrics['acc_at_eer']:.4f} | "
                     f"Acc@0.5={metrics['acc_at_05']:.4f}"
                 )
@@ -531,7 +501,7 @@ if __name__ == '__main__':
 
     print(f"\n{'=' * 55}")
     print('Final evaluation on test set:')
-    model.load_state_dict(torch.load(model_save_path, weights_only=True))
+    model.load_state_dict(torch.load(model_save_path, map_location=DEVICE, weights_only=True))
     final_metrics = (
         evaluate_seq2seq(model, test_loader, DEVICE)
         if args.mode == 'seq2seq'
@@ -576,6 +546,8 @@ if __name__ == '__main__':
     results = {
         'dataset': args.dataset,
         'mode': args.mode,
+        'selection': selection_name,
+        'best_selection_metric': float(best_metric),
         'hyperparams': {
             'encoder_type': args.encoder,
             'hidden_dim': HIDDEN_DIM,
@@ -583,6 +555,9 @@ if __name__ == '__main__':
             'lr': args.lr,
             'epochs': args.epochs,
             'n_classes': n_classes,
+            'seg_len': args.seg_len,
+            'resample': use_resample,
+            'standardized': feature_stats is not None,
         },
         'final_metrics': {
             k: float(v) if isinstance(v, (float, np.floating)) else v
