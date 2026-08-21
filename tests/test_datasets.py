@@ -9,6 +9,7 @@ from dataset import (
     LipVerificationDataset,
     SequenceVerificationDataset,
     SEG_LEN,
+    compute_split_stats,
     sequence_collate_fn,
     transcription_collate_fn,
 )
@@ -162,6 +163,35 @@ class CollateTests(unittest.TestCase):
         self.assertEqual(targets.shape, (2, 9))
         self.assertEqual(targets[1, 6].item(), 12)
         self.assertEqual(targets[1, 7].item(), 10)
+
+
+class ComputeSplitStatsTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.rng = np.random.RandomState(4)
+
+    def test_stats_use_only_filtered_speakers(self):
+        sequences = [['1'] * 8, ['2'] * 8]
+        segs_a = [np.full((5, FEATURE_DIM), 0.0, dtype=np.float32) for _ in range(8)]
+        segs_b = [np.full((5, FEATURE_DIM), 10.0, dtype=np.float32) for _ in range(8)]
+        path = _write_npz(
+            self._tmp.name, 'a.npz', sequences, [segs_a, segs_b],
+            speakers=['alice', 'bob'],
+        )
+        stats = compute_split_stats(path, dataset='digit', resample=False,
+                                    speaker_filter={'alice'})
+        np.testing.assert_allclose(stats['mean'], [0.0] * FEATURE_DIM, atol=1e-6)
+        self.assertEqual(stats['n_frames'], 40)
+
+    def test_stats_reflect_resampled_lengths(self):
+        sequences = [['1'] * 8]
+        segments = [[_seg(self.rng, 6) for _ in range(8)]]
+        path = _write_npz(self._tmp.name, 'a.npz', sequences, segments)
+        stats = compute_split_stats(path, dataset='digit', resample=True, seg_len=16)
+        self.assertEqual(stats['n_frames'], 8 * 16)
 
 
 if __name__ == '__main__':

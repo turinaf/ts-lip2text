@@ -4,7 +4,7 @@ from torch.utils.data import Dataset
 import argparse
 
 from model import CHAR_TO_IDX, N_CLASSES, VOCAB
-from transforms import correct_lip_speed_fps, resample_segment, standardize_segment
+from transforms import compute_feature_stats, correct_lip_speed_fps, resample_segment, standardize_segment
 
 
 MAX_SEQ_LEN = 30
@@ -127,6 +127,26 @@ def _transform_segment(seg, fps, n_features, resample, seg_len, feature_stats):
     if feature_stats is not None:
         seg = standardize_segment(seg, feature_stats['mean'], feature_stats['std'])
     return seg
+
+
+def compute_split_stats(npz_path, dataset='digit', expected_len=EXPECTED_N_DIGITS,
+                        resample=True, seg_len=SEG_LEN, speaker_filter=None):
+    """Per-feature stats over transformed (unstandardized) segments of a split."""
+    prepared = _prepare_samples(
+        npz_path, dataset=dataset, expected_len=expected_len, speaker_filter=speaker_filter,
+    )
+    segments = prepared['segments']
+    fps = prepared['fps']
+    feature_names = prepared['feature_names']
+    n_features = len(feature_names) if feature_names else _infer_n_features(segments)
+
+    def iter_segments():
+        for vid_idx in range(len(segments)):
+            video_fps = fps[vid_idx]
+            for seg in segments[vid_idx]:
+                yield _transform_segment(seg, video_fps, n_features, resample, seg_len, None)
+
+    return compute_feature_stats(iter_segments(), n_features)
 
 
 # --- Dataset ---
