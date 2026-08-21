@@ -22,7 +22,7 @@ class LipEncoder(nn.Module):
 
     def __init__(
         self,
-        n_features=5,
+        n_features=8,
         hidden_dim=128,
         embed_dim=64,
         encoder_type='transformer',
@@ -115,7 +115,7 @@ class DigitVerifier(nn.Module):
         self,
         n_classes=N_CLASSES,
         embed_dim=64,
-        n_features=5,
+        n_features=8,
         hidden_dim=128,
         encoder_type='transformer',
     ):
@@ -154,8 +154,8 @@ class SequenceVerifier(nn.Module):
     Full-sequence verification: verify all 8 digits at once.
     Encodes each segment, compares with claimed digit, aggregates scores.
     """
-    def __init__(self, n_classes=N_CLASSES, embed_dim=64, seq_len=8,
-                 n_features=5, hidden_dim=128, encoder_type='transformer'):
+    def __init__(self, n_classes=N_CLASSES, embed_dim=64,
+                 n_features=8, hidden_dim=128, encoder_type='transformer'):
         super().__init__()
         self.lip_encoder = LipEncoder(
             n_features,

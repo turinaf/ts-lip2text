@@ -381,7 +381,6 @@ if __name__ == '__main__':
         model = SequenceVerifier(
             n_classes=n_classes,
             embed_dim=EMBED_DIM,
-            seq_len=seq_len,
             n_features=n_features,
             hidden_dim=HIDDEN_DIM,
             encoder_type=args.encoder,

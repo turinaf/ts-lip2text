@@ -121,7 +121,6 @@ def build_model(mode: str, vocab_size: int, n_features: int, seq_len: int):
         return SequenceVerifier(
             n_classes=vocab_size,
             embed_dim=EMBED_DIM,
-            seq_len=seq_len,
             n_features=n_features,
             hidden_dim=HIDDEN_DIM,
         ).to(DEVICE)
