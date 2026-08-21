@@ -43,3 +43,63 @@ def resample_segment(seg, target_len):
         [np.interp(dst, src, seg[:, j]) for j in range(seg.shape[1])], axis=1
     )
     return resampled.astype(np.float32)
+
+
+def compute_feature_stats(segments, n_features):
+    """Per-feature mean/std over all frames of an iterable of (T, F) segments."""
+    acc = np.zeros(n_features, dtype=np.float64)
+    acc_sq = np.zeros(n_features, dtype=np.float64)
+    count = 0
+    for seg in segments:
+        seg = np.asarray(seg, dtype=np.float64)
+        acc += seg.sum(axis=0)
+        acc_sq += (seg ** 2).sum(axis=0)
+        count += seg.shape[0]
+    if count == 0:
+        raise ValueError('no frames available to compute feature statistics')
+    mean = acc / count
+    var = acc_sq / count - mean ** 2
+    std = np.sqrt(np.maximum(var, 0.0))
+    return {
+        'mean': mean.astype(np.float32).tolist(),
+        'std': std.astype(np.float32).tolist(),
+        'n_frames': int(count),
+    }
+
+
+def standardize_segment(seg, mean, std):
+    """z-score a segment with precomputed per-feature stats (zero std clamped)."""
+    seg = np.asarray(seg, dtype=np.float32)
+    mean = np.asarray(mean, dtype=np.float32)
+    std = np.asarray(std, dtype=np.float32)
+    return (seg - mean) / np.maximum(std, 1e-6)
+
+
+def save_feature_stats(path, stats, feature_names):
+    """Persist stats + feature order so eval/inference apply the same transform."""
+    payload = {
+        'feature_names': list(feature_names),
+        'mean': stats['mean'],
+        'std': stats['std'],
+        'n_frames': stats['n_frames'],
+    }
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(payload, f, indent=2)
+    return path
+
+
+def load_feature_stats(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f'Feature stats not found: {path}. Run train.py (with standardization '
+            'enabled) once so the file is created next to the npz data.'
+        )
+    with open(path) as f:
+        stats = json.load(f)
+    return {
+        'feature_names': list(stats['feature_names']),
+        'mean': list(stats['mean']),
+        'std': list(stats['std']),
+        'n_frames': int(stats['n_frames']),
+    }
