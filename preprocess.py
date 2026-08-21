@@ -423,6 +423,20 @@ def save_split(samples, filepath, feature_names):
     print(f"Saved {len(samples)} samples to {filepath}")
 
 
+def _summarize_samples(all_samples, failed_videos):
+    """Sequence-length distribution and failure-reason counts for metadata."""
+    seq_len_counts = defaultdict(int)
+    for s in all_samples:
+        seq_len_counts[len(s['digit_sequence'])] += 1
+    failure_counts = defaultdict(int)
+    for _, reason in failed_videos:
+        failure_counts[reason] += 1
+    return {
+        'seq_len_dist': {str(k): int(v) for k, v in sorted(seq_len_counts.items())},
+        'failure_counts': dict(sorted(failure_counts.items())),
+    }
+
+
 def main():
     # --- Main preprocessing ---
     args = parse_args()
@@ -647,6 +661,7 @@ def main():
         'n_failed': len(failed_videos),
         'digits_per_video': 8 if args.dataset == 'digit' else None,
         'resumed_from_cache': resumed_samples if resume_enabled else 0,
+        **_summarize_samples(all_samples, failed_videos),
     }
     with open(os.path.join(output_dir, 'metadata.json'), 'w') as f:
         json.dump(metadata, f, indent=2)
