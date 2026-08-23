@@ -21,8 +21,10 @@ import argparse
 import os
 import json
 
+import checkpoint as ckpt
 from model import (DigitVerifier, SequenceVerifier,
                    TinyLipSeq2Seq, CHAR_TO_IDX, VOCAB, N_CLASSES)
+from transforms import correct_lip_speed_fps, load_feature_stats, resample_segment, standardize_segment
 
 # --- Configuration ---
 FACE_MODEL_PATH = 'data/face_landmarker.task'
@@ -38,23 +40,40 @@ EOS_IDX = N_CLASSES + 2
 SEQ2SEQ_VOCAB_SIZE = N_CLASSES + 3
 
 
-def _dataset_model_dir(dataset, encoder_type):
-    if encoder_type == 'transformer':
-        return os.path.join(MODEL_DIR, 'transformer_encoder')
+def _candidate_model_paths(dataset, mode, encoder=None):
+    """New layout first, then legacy layouts."""
+    encoders = ([encoder] if encoder else []) + ['transformer', 'bigru']
+    paths = [os.path.join(MODEL_DIR, dataset, enc, f'best_{mode}.pt' if mode == 'seq2seq'
+                          else f'best_{mode}_verifier.pt') for enc in encoders]
+    paths.append(os.path.join(MODEL_DIR, 'transformer_encoder',
+                              f'best_{mode}.pt' if mode == 'seq2seq' else f'best_{mode}_verifier.pt'))
     if dataset == 'digit':
-        return MODEL_DIR
-    return os.path.join(MODEL_DIR, dataset)
+        paths.append(os.path.join(MODEL_DIR, f'best_{mode}.pt' if mode == 'seq2seq'
+                                  else f'best_{mode}_verifier.pt'))
+    else:
+        paths.append(os.path.join(MODEL_DIR, dataset, f'best_{mode}.pt' if mode == 'seq2seq'
+                                  else f'best_{mode}_verifier.pt'))
+    seen, unique = set(), []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
 
 
-def _default_model_path(dataset, mode, encoder_type):
-    model_dir = _dataset_model_dir(dataset, encoder_type)
-    if mode == 'seq2seq':
-        return os.path.join(model_dir, 'best_seq2seq.pt')
-    return os.path.join(model_dir, f'best_{mode}_verifier.pt')
-
-
-def _default_vocab_path(dataset, encoder_type):
-    return os.path.join(_dataset_model_dir(dataset, encoder_type), 'vocab.json')
+def _default_vocab_path_candidates(dataset, encoder_type=None):
+    encoders = ([encoder_type] if encoder_type else []) + ['transformer', 'bigru']
+    paths = [os.path.join(MODEL_DIR, dataset, enc, 'vocab.json') for enc in encoders]
+    paths.append(os.path.join(MODEL_DIR, 'transformer_encoder', 'vocab.json'))
+    paths.append(os.path.join(MODEL_DIR, dataset, 'vocab.json'))
+    if dataset == 'digit':
+        paths.append(os.path.join(MODEL_DIR, 'vocab.json'))
+    seen, unique = set(), []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
 
 
 def _load_token_mappings(dataset, vocab_path):
@@ -319,15 +338,6 @@ def segment_by_lip_speed(features, n_digits, fps, smooth_window=3):
     print(f"  Auto-segmented: [{frames_info}]")
     return segments
 
-    # Build segments from boundaries
-    starts = [0] + boundaries
-    ends = boundaries + [T]
-    segments = [features[s:e] for s, e in zip(starts, ends)]
-
-    frames_info = ' | '.join(f'{e-s}fr' for s, e in zip(starts, ends))
-    print(f"  Auto-segmented: [{frames_info}]")
-    return segments
-
 
 def pad_segment(seg, max_len):
     """Pad/truncate a segment to max_len, return (feat, mask)."""
@@ -370,12 +380,40 @@ def infer_n_digits_from_segments(segments):
     return len(segments)
 
 
+def _infer_legacy_seq2seq_lens(state_dict):
+    """(max_src_len, max_tgt_len, seg_embed_dim) from a legacy checkpoint."""
+    src = state_dict.get('src_pos_emb.weight')
+    tgt = state_dict.get('tgt_pos_emb.weight')
+    max_src_len = int(src.shape[0]) if src is not None else 12
+    max_tgt_len = int(tgt.shape[0]) if tgt is not None else 12
+    seg_embed_dim = int(src.shape[1]) if src is not None else 48
+    return max_src_len, max_tgt_len, seg_embed_dim
+
+
+def _apply_transforms(segments, fps, config, stats_dir):
+    """Apply config-declared fps-correct + resample + standardize to segments."""
+    if config is None:
+        return segments
+    out = list(segments)
+    if config.get('resample', False):
+        out = [resample_segment(correct_lip_speed_fps(s, fps), config['seg_len'])
+               for s in out]
+    if config.get('standardized', False):
+        stats = load_feature_stats(os.path.join(stats_dir, 'feature_stats.json'))
+        if list(stats['feature_names']) != list(config['feature_names']):
+            raise RuntimeError(
+                'feature_stats.json feature order does not match checkpoint config'
+            )
+        out = [standardize_segment(s, stats['mean'], stats['std']) for s in out]
+    return out
+
+
 # --- Inference ---
-def infer_sequence(model, segments, tokens, token_to_idx, device):
+def infer_sequence(model, segments, tokens, token_to_idx, device, pad_len):
     """Run sequence-level verification."""
     all_feats, all_masks = [], []
     for seg in segments:
-        f, m = pad_segment(seg, MAX_SEQ_LEN)
+        f, m = pad_segment(seg, pad_len)
         all_feats.append(f)
         all_masks.append(m)
 
@@ -391,11 +429,11 @@ def infer_sequence(model, segments, tokens, token_to_idx, device):
     return prob
 
 
-def infer_per_digit(model, segments, tokens, token_to_idx, device):
+def infer_per_digit(model, segments, tokens, token_to_idx, device, pad_len):
     """Run per-digit verification, return per-digit probabilities."""
     results = []
     for seg, token in zip(segments, tokens):
-        feat, mask = pad_segment(seg, MAX_SEQ_LEN)
+        feat, mask = pad_segment(seg, pad_len)
         feat_t = torch.FloatTensor(feat).unsqueeze(0).to(device)    # (1, T, 5)
         mask_t = torch.FloatTensor(mask).unsqueeze(0).to(device)    # (1, T)
         digit_idx = token_to_idx[token]
@@ -409,11 +447,11 @@ def infer_per_digit(model, segments, tokens, token_to_idx, device):
     return results
 
 
-def infer_seq2seq(model, segments, device, max_len, bos_idx, pad_idx, eos_idx):
+def infer_seq2seq(model, segments, device, max_len, bos_idx, pad_idx, eos_idx, pad_len):
     """Run seq2seq transcription and return predicted token ids."""
     all_feats, all_masks = [], []
     for seg in segments:
-        f, m = pad_segment(seg, MAX_SEQ_LEN)
+        f, m = pad_segment(seg, pad_len)
         all_feats.append(f)
         all_masks.append(m)
 
@@ -469,9 +507,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     if args.dataset == 'grid' and args.mode == 'seq2seq' and args.model_path is None:
-        default_grid_seq2seq = _default_model_path(args.dataset, args.mode, 'bigru')
-        default_grid_transformer_seq2seq = _default_model_path(args.dataset, args.mode, 'transformer')
-        if not os.path.exists(default_grid_seq2seq) and not os.path.exists(default_grid_transformer_seq2seq):
+        candidates = _candidate_model_paths(args.dataset, args.mode, None)
+        if not any(os.path.exists(path) for path in candidates):
             print('ERROR: No default GRID seq2seq checkpoint found. Provide --model_path explicitly.')
             exit(1)
 
@@ -490,21 +527,12 @@ if __name__ == '__main__':
     resolved_encoder = args.encoder
     if args.model_path:
         model_path = args.model_path
-    elif args.encoder != 'auto':
-        model_path = _default_model_path(args.dataset, args.mode, args.encoder)
     else:
-        candidate_paths = []
-        if args.dataset == 'digit':
-            candidate_paths.extend([
-                _default_model_path(args.dataset, args.mode, 'transformer'),
-                _default_model_path(args.dataset, args.mode, 'bigru'),
-            ])
-        else:
-            candidate_paths.extend([
-                _default_model_path(args.dataset, args.mode, 'bigru'),
-                _default_model_path(args.dataset, args.mode, 'transformer'),
-            ])
-        model_path = next((path for path in candidate_paths if os.path.exists(path)), candidate_paths[0])
+        candidate_paths = _candidate_model_paths(
+            args.dataset, args.mode,
+            args.encoder if args.encoder != 'auto' else None)
+        model_path = next((path for path in candidate_paths if os.path.exists(path)),
+                          candidate_paths[0])
 
     if not os.path.exists(args.video):
         print(f"ERROR: Video not found: {args.video}")
@@ -516,19 +544,17 @@ if __name__ == '__main__':
         print(f"ERROR: Face landmarker model not found: {args.face_model}")
         exit(1)
 
+    state_dict = torch.load(model_path, map_location=DEVICE, weights_only=True)
+    config = ckpt.load_model_config(model_path, mode=args.mode)
+    if resolved_encoder == 'auto':
+        resolved_encoder = config['encoder_type'] if config else _detect_encoder_type(state_dict)
+
     vocab_path = args.vocab_path
     if vocab_path is None and args.dataset != 'digit':
-        candidate_vocab_paths = [
-            _default_vocab_path(args.dataset, resolved_encoder if resolved_encoder != 'auto' else 'bigru'),
-            _default_vocab_path(args.dataset, 'transformer'),
-        ]
+        candidate_vocab_paths = _default_vocab_path_candidates(
+            args.dataset,
+            resolved_encoder if resolved_encoder != 'auto' else None)
         vocab_path = next((path for path in candidate_vocab_paths if os.path.exists(path)), None)
-
-    state_dict = torch.load(model_path, map_location=DEVICE, weights_only=True)
-    if resolved_encoder == 'auto':
-        resolved_encoder = _detect_encoder_type(state_dict)
-    if vocab_path is None and args.dataset != 'digit':
-        vocab_path = _default_vocab_path(args.dataset, resolved_encoder)
     if vocab_path is not None and not os.path.exists(vocab_path):
         print(f"ERROR: Vocabulary not found: {vocab_path}")
         exit(1)
@@ -587,6 +613,9 @@ if __name__ == '__main__':
     n_features = infer_input_feature_dim(state_dict)
     features = adapt_feature_dim(features, n_features)
     segments = [adapt_feature_dim(seg, n_features) for seg in segments]
+    stats_dir = os.path.join('processed_data', args.dataset)
+    segments = _apply_transforms(segments, fps, config, stats_dir)
+    pad_len = config['seg_len'] if config and config.get('resample') else MAX_SEQ_LEN
     n_digits = infer_n_digits_from_segments(segments)
 
     if tokens is not None:
@@ -597,7 +626,9 @@ if __name__ == '__main__':
                 exit(1)
 
     # 4. Load model
-    if args.mode == 'digit':
+    if config is not None:
+        model = ckpt.build_model_from_config(config, DEVICE)
+    elif args.mode == 'digit':
         model = DigitVerifier(n_classes=n_classes, embed_dim=EMBED_DIM,
                               n_features=n_features, hidden_dim=HIDDEN_DIM,
                               encoder_type=resolved_encoder).to(DEVICE)
@@ -606,20 +637,12 @@ if __name__ == '__main__':
                                  n_features=n_features, hidden_dim=HIDDEN_DIM,
                                  encoder_type=resolved_encoder).to(DEVICE)
     else:
+        legacy_src, legacy_tgt, legacy_dim = _infer_legacy_seq2seq_lens(state_dict)
         model = TinyLipSeq2Seq(
-            vocab_size=seq2seq_vocab_size,
-            pad_idx=pad_idx,
-            n_features=n_features,
-            seg_embed_dim=48,
-            n_heads=4,
-            n_encoder_layers=1,
-            n_decoder_layers=1,
-            ff_dim=128,
-            dropout=0.1,
-            max_src_len=12,
-            max_tgt_len=12,
-            hidden_dim=64,
-            encoder_type=resolved_encoder,
+            vocab_size=seq2seq_vocab_size, pad_idx=pad_idx, n_features=n_features,
+            seg_embed_dim=legacy_dim, n_heads=4, n_encoder_layers=1, n_decoder_layers=1,
+            ff_dim=128, dropout=0.1, max_src_len=legacy_src, max_tgt_len=legacy_tgt,
+            hidden_dim=64, encoder_type=resolved_encoder,
         ).to(DEVICE)
 
     model.load_state_dict(state_dict)
@@ -644,17 +667,18 @@ if __name__ == '__main__':
             bos_idx=bos_idx,
             pad_idx=pad_idx,
             eos_idx=eos_idx,
+            pad_len=pad_len,
         )
         pred_tokens = [idx_to_token[i] for i in pred_ids if i in idx_to_token]
         print(f"\n  Predicted tokens: {' '.join(pred_tokens) if pred_tokens else '(empty)'}")
         if args.lab:
             print(f"  Ground truth: {' '.join(tokens)}")
     elif args.mode == 'sequence':
-        prob = infer_sequence(model, segments, tokens, token_to_idx, DEVICE)
+        prob = infer_sequence(model, segments, tokens, token_to_idx, DEVICE, pad_len)
         print(f"\n  Claimed tokens: {' '.join(tokens)}")
         print(f"  Sequence probability: {prob:.4f}")
     else:
-        digit_results = infer_per_digit(model, segments, tokens, token_to_idx, DEVICE)
+        digit_results = infer_per_digit(model, segments, tokens, token_to_idx, DEVICE, pad_len)
         print(f"\n  Per-token probabilities:")
         for token, prob in digit_results:
             print(f"    Token '{token}': {prob:.4f}")
