@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import dataclass
+from functools import partial
 
 import numpy as np
 import torch
@@ -22,6 +23,8 @@ from dataset import (
     LipTranscriptionDataset,
     LipVerificationDataset,
     SequenceVerificationDataset,
+    sequence_collate_fn,
+    transcription_collate_fn,
 )
 from model import DigitVerifier, SequenceVerifier, TinyLipSeq2Seq
 
@@ -59,7 +62,13 @@ def max_sequence_length(dataset) -> int:
 
 
 def _assert_finite_array(name: str, arr: np.ndarray) -> None:
-    array = np.asarray(arr)
+    try:
+        array = np.asarray(arr)
+    except ValueError:
+        for item in arr:
+            _assert_finite_array(name, item)
+        return
+
     if array.dtype == object:
         for item in array:
             _assert_finite_array(name, item)
@@ -135,7 +144,16 @@ def check_forward_pass(dataset_name: str, mode: str, train_path: str) -> None:
     test_ds = build_dataset(dataset_name, mode, train_path, token_to_idx=train_ds.token_to_idx)
     seq_len = max(max_sequence_length(train_ds), max_sequence_length(test_ds))
     model = build_model(mode, train_ds.vocab_size, train_ds.n_features, seq_len)
-    loader = DataLoader(train_ds, batch_size=2, shuffle=False, num_workers=0)
+
+    collate_fn = None
+    if mode == 'sequence':
+        collate_fn = sequence_collate_fn
+    elif mode == 'seq2seq':
+        collate_fn = partial(transcription_collate_fn,
+                             pad_idx=train_ds.vocab_size,
+                             eos_idx=train_ds.vocab_size + 2)
+    loader = DataLoader(train_ds, batch_size=2, shuffle=False, num_workers=0,
+                        collate_fn=collate_fn)
 
     batch = next(iter(loader))
     model.eval()

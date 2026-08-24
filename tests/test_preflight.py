@@ -78,6 +78,44 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(trn_ds.token_to_idx['DOOR'], 0)
             self.assertEqual(trn_ds.token_to_idx['WORLD'], 4)
 
+    def _write_npz_with_list_samples(self, npz_path, sequences, segments):
+        seg_arr = np.empty(len(segments), dtype=object)
+        seg_arr[:] = segments
+        ff_arr = np.empty(len(segments), dtype=object)
+        ff_arr[:] = [np.concatenate(sample, axis=0) for sample in segments]
+        np.savez_compressed(
+            npz_path,
+            digit_segments=seg_arr,
+            digit_sequences=np.array(sequences, dtype=object),
+            full_features=ff_arr,
+            feature_names=np.array([f'f{i}' for i in range(8)]),
+        )
+
+    def test_check_npz_accepts_list_valued_ragged_samples(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            npz_path = os.path.join(tmpdir, 'ragged.npz')
+            self._write_npz_with_list_samples(
+                npz_path,
+                [['1', '2'], ['3']],
+                [[_make_segment(4), _make_segment(6)], [_make_segment(5)]],
+            )
+
+            check_npz_file(npz_path)
+
+    def test_check_npz_rejects_nan_inside_list_samples(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            npz_path = os.path.join(tmpdir, 'bad_ragged.npz')
+            bad = _make_segment(4)
+            bad[0, 0] = np.nan
+            self._write_npz_with_list_samples(
+                npz_path,
+                [['1']],
+                [[_make_segment(4), bad]],
+            )
+
+            with self.assertRaises(ValueError):
+                check_npz_file(npz_path)
+
     def test_check_npz_rejects_nan(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             npz_path = os.path.join(tmpdir, 'bad.npz')
@@ -120,6 +158,38 @@ class PreflightTests(unittest.TestCase):
             _write_npz(npz_path, sequences, segments)
 
             check_forward_pass('digit', 'digit', npz_path)
+
+    def test_forward_pass_sequence_mode_is_finite(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            npz_path = os.path.join(tmpdir, 'sample.npz')
+            sequences = [
+                ['1', '2', '3', '4', '5', '6', '7', '8'],
+                ['3', '5', '7'],
+            ]
+            segments = [
+                [_make_segment(4), _make_segment(6), _make_segment(5), _make_segment(7),
+                 _make_segment(8), _make_segment(5), _make_segment(4), _make_segment(6)],
+                [_make_segment(5), _make_segment(6), _make_segment(7)],
+            ]
+            _write_npz(npz_path, sequences, segments)
+
+            check_forward_pass('digit', 'sequence', npz_path)
+
+    def test_forward_pass_seq2seq_mode_is_finite(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            npz_path = os.path.join(tmpdir, 'sample.npz')
+            sequences = [
+                ['1', '2', '3', '4', '5', '6', '7', '8'],
+                ['3', '5', '7'],
+            ]
+            segments = [
+                [_make_segment(4), _make_segment(6), _make_segment(5), _make_segment(7),
+                 _make_segment(8), _make_segment(5), _make_segment(4), _make_segment(6)],
+                [_make_segment(5), _make_segment(6), _make_segment(7)],
+            ]
+            _write_npz(npz_path, sequences, segments)
+
+            check_forward_pass('digit', 'seq2seq', npz_path)
 
     def test_build_model_smoke(self):
         digit_model = build_model('digit', 11, 8, 8)
