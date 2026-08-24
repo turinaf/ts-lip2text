@@ -96,6 +96,20 @@ python train.py -dataset [digit or grid] --mode digit --encoder [transformer or 
 
 ```
 
+#### Data pipeline flags (default on)
+
+- Segments are resampled to a fixed length (`--seg-len`, default 16) after
+  converting `lip_speed` to per-second units — makes trajectories comparable
+  across videos with different fps.
+- Features are standardized with train-split per-feature stats stored in
+  `processed_data/<dataset>/feature_stats.json` (created on first run).
+- Escape hatches reproduce the legacy pipeline: `--no-resample --no-standardize`.
+- Best checkpoint is selected on a speaker-disjoint validation split (every
+  10th sorted train speaker); test is evaluated once at the end.
+- Every checkpoint dir also stores `vocab.json` and `config_<mode>.json`;
+  `test.py`/`inference.py` rebuild the model from the config.
+- Checkpoints live in `models/<dataset>/<encoder_type>/`.
+
 Training outputs:
 
 - checkpoints in `models/`
@@ -113,9 +127,9 @@ tensorboard --logdir runs/
 `test.py` currently supports verification modes (`digit`, `sequence`):
 
 ```bash
-python test.py --mode sequence
-python test.py --mode digit
-python test.py --mode sequence --save
+python test.py --dataset digit --mode sequence
+python test.py --dataset grid --mode digit
+python test.py --dataset digit --mode digit --save
 ```
 
 `--save` writes `models/test_results_<mode>.json`.
